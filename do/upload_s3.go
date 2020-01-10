@@ -46,27 +46,35 @@ var sumLatestExe = "https://kjkpub.s3.amazonaws.com/sumatrapdf/prerel/SumatraPDF
 var sumLatestPdb = "https://kjkpub.s3.amazonaws.com/sumatrapdf/prerel/SumatraPDF-prerelease-10175.pdb.zip";
 var sumLatestInstaller = "https://kjkpub.s3.amazonaws.com/sumatrapdf/prerel/SumatraPDF-prerelease-10175-install.exe";
 */
-func createSumatraLatestJs(dir string) string {
+func createSumatraLatestJs(buildType string) string {
+	appName := "SumatraPDF-prerelease"
+	if buildType == buildTypeRaMicro {
+		// must match name in spacesUploadPreReleaseMust
+		appName = "RAMicro-prerelease"
+	}
 	currDate := time.Now().Format("2006-01-02")
-	v := svnPreReleaseVer
+	v := preReleaseVer
 	tmplText := `
 var sumLatestVer = {{.Ver}};
 var sumBuiltOn = "{{.CurrDate}}";
-var sumLatestName = "SumatraPDF-prerelease-{{.Ver}}.exe";
+var sumLatestName = "{{.AppName}}-{{.Ver}}.exe";
 
-var sumLatestExe         = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}.exe";
-var sumLatestPdb         = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}.pdb.zip";
-var sumLatestInstaller   = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}-install.exe";
+var sumLatestExe         = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}.exe";
+var sumLatestExeZip      = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}.zip";
+var sumLatestPdb         = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}.pdb.zip";
+var sumLatestInstaller   = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}-install.exe";
 
-var sumLatestExe64       = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}-64.exe";
-var sumLatestPdb64       = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}-64.pdb.zip";
-var sumLatestInstaller64 = "{{.Host}}{{.Dir}}/SumatraPDF-prerelease-{{.Ver}}-64-install.exe";
+var sumLatestExe64       = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}-64.exe";
+var sumLatestExeZip64    = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}-64.zip";
+var sumLatestPdb64       = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}-64.pdb.zip";
+var sumLatestInstaller64 = "{{.Host}}{{.Dir}}/{{.AppName}}-{{.Ver}}-64-install.exe";
 `
 	d := map[string]interface{}{
 		"Host":     "https://kjkpubsf.sfo2.digitaloceanspaces.com/software/sumatrapdf/",
 		"Ver":      v,
-		"Dir":      dir,
+		"Dir":      buildType,
 		"CurrDate": currDate,
+		"AppName":  appName,
 	}
 	return execTextTemplate(tmplText, d)
 }
@@ -166,6 +174,8 @@ func s3UploadPreReleaseMust(ver string, buildType string) {
 		return
 	}
 
+	panicIf(buildType == buildTypeRaMicro, "only uploading ramicro to spaces")
+
 	remoteDir := getRemoteDir(buildType)
 
 	c := newS3Client()
@@ -173,26 +183,16 @@ func s3UploadPreReleaseMust(ver string, buildType string) {
 
 	timeStart := time.Now()
 
-	verifyPreReleaseNotInS3Must(c, remoteDir, svnPreReleaseVer)
+	verifyPreReleaseNotInS3Must(c, remoteDir, preReleaseVer)
 
 	prefix := fmt.Sprintf("SumatraPDF-prerelease-%s", ver)
 	manifestRemotePath := remoteDir + prefix + "-manifest.txt"
-	files := []string{
-		"SumatraPDF.exe", fmt.Sprintf("%s.exe", prefix),
-		"SumatraPDF-dll.exe", fmt.Sprintf("%s-install.exe", prefix),
-		"SumatraPDF.pdb.zip", fmt.Sprintf("%s.pdb.zip", prefix),
-		"SumatraPDF.pdb.lzsa", fmt.Sprintf("%s.pdb.lzsa", prefix),
-	}
+	files := getFileNamesWithPrefix(prefix)
 	err := s3UploadFiles(c, remoteDir, filepath.Join("out", "rel32"), files)
 	fatalIfErr(err)
 
 	prefix = fmt.Sprintf("SumatraPDF-prerelease-%s-64", ver)
-	files = []string{
-		"SumatraPDF.exe", fmt.Sprintf("%s.exe", prefix),
-		"SumatraPDF-dll.exe", fmt.Sprintf("%s-install.exe", prefix),
-		"SumatraPDF.pdb.zip", fmt.Sprintf("%s.pdb.zip", prefix),
-		"SumatraPDF.pdb.lzsa", fmt.Sprintf("%s.pdb.lzsa", prefix),
-	}
+	files = getFileNamesWithPrefix(prefix)
 	err = s3UploadFiles(c, remoteDir, filepath.Join("out", "rel64"), files)
 	fatalIfErr(err)
 

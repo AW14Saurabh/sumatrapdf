@@ -130,7 +130,7 @@ char* NormalizeURL(const char* url, const char* base) {
             *dst++ = '/';
     }
     *dst = '\0';
-    return norm.StealData();
+    return norm.release();
 }
 
 inline char decode64(char c) {
@@ -432,7 +432,7 @@ bool EpubDoc::Load() {
             continue;
         }
         char* decoded = DecodeTextToUtf8(html.data, true);
-        html.TakeOwnership(decoded);
+        html.TakeOwnershipOf(decoded);
         if (!html.data) {
             continue;
         }
@@ -610,7 +610,7 @@ bool EpubDoc::ParseNavToc(const char* data, size_t dataLen, const char* pagePath
                 if (tok->IsText()) {
                     AutoFree part(str::DupN(tok->s, tok->sLen));
                     if (!text) {
-                        text.Set(part.StealData());
+                        text.Set(part.release());
                     } else {
                         text.Set(str::Join(text, part));
                     }
@@ -845,7 +845,7 @@ bool Fb2Doc::Load() {
     if (!tmp) {
         return false;
     }
-    data.TakeOwnership(tmp);
+    data.TakeOwnershipOf(tmp);
 
     HtmlPullParser parser(data.Get(), data.size());
     HtmlToken* tok;
@@ -882,16 +882,17 @@ bool Fb2Doc::Load() {
                    !(tok->IsEndTag() && tok->NameIsNS("author", FB2_MAIN_NS))) {
                 if (tok->IsText()) {
                     AutoFree author(ResolveHtmlEntities(tok->s, tok->sLen));
-                    if (docAuthor)
+                    if (docAuthor) {
                         docAuthor.Set(str::Join(docAuthor, " ", author));
-                    else
-                        docAuthor.Set(author.StealData());
+                    } else {
+                        docAuthor.Set(author.release());
+                    }
                 }
             }
             if (docAuthor) {
                 str::NormalizeWS(docAuthor);
                 if (!str::IsEmpty(docAuthor.Get()))
-                    props.Set(DocumentProperty::Author, docAuthor.StealData(), inTitleInfo != 0);
+                    props.Set(DocumentProperty::Author, docAuthor.release(), inTitleInfo != 0);
             }
         } else if (inTitleInfo && tok->IsStartTag() && tok->NameIsNS("date", FB2_MAIN_NS)) {
             AttrInfo* attr = tok->GetAttrByNameNS("value", FB2_MAIN_NS);
@@ -1298,7 +1299,7 @@ ImageData* HtmlDoc::GetImageData(const char* fileName) {
     }
     data.base.data = (char*)urlData.data();
     data.base.len = urlData.size();
-    data.fileName = url.StealData();
+    data.fileName = url.release();
     images.Append(data);
     return &images.Last().base;
 }
@@ -1477,12 +1478,12 @@ static const char* TextFindRfcEnd(str::Str& htmlData, const char* curr) {
 bool TxtDoc::Load() {
     AutoFree text(file::ReadFile(fileName));
     if (str::EndsWithI(fileName, L".tcr") && str::StartsWith(text.data, TCR_HEADER)) {
-        text.TakeOwnership(DecompressTcrText(text.data, text.size()));
+        text.TakeOwnershipOf(DecompressTcrText(text.data, text.size()));
     }
     if (!text.data) {
         return false;
     }
-    text.TakeOwnership(DecodeTextToUtf8(text.data));
+    text.TakeOwnershipOf(DecodeTextToUtf8(text.data));
     if (!text.data) {
         return false;
     }

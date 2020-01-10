@@ -207,9 +207,9 @@ static void OpenUsingDde(HWND targetWnd, const WCHAR* filePath, CommandLineInfo&
     str::WStr cmd;
     cmd.AppendFmt(L"[Open(\"%s\", 0, 1, 0)]", fullpath);
     if (i.destName && isFirstWin) {
-        cmd.AppendFmt(L"[" DDECOMMAND_GOTO L"(\"%s\", \"%s\")]", fullpath, i.destName);
+        cmd.AppendFmt(L"[GotoNamedDest(\"%s\", \"%s\")]", fullpath, i.destName);
     } else if (i.pageNumber > 0 && isFirstWin) {
-        cmd.AppendFmt(L"[" DDECOMMAND_PAGE L"(\"%s\", %d)]", fullpath, i.pageNumber);
+        cmd.AppendFmt(L"[GotoPage(\"%s\", %d)]", fullpath, i.pageNumber);
     }
     if ((i.startView != DM_AUTOMATIC || i.startZoom != INVALID_ZOOM ||
          i.startScroll.x != -1 && i.startScroll.y != -1) &&
@@ -228,8 +228,9 @@ static void OpenUsingDde(HWND targetWnd, const WCHAR* filePath, CommandLineInfo&
         // try WM_COPYDATA first, as that allows targetting a specific window
         COPYDATASTRUCT cds = {0x44646557 /* DdeW */, (DWORD)(cmd.size() + 1) * sizeof(WCHAR), cmd.Get()};
         LRESULT res = SendMessage(targetWnd, WM_COPYDATA, 0, (LPARAM)&cds);
-        if (res)
+        if (res) {
             return;
+        }
     }
     DDEExecute(PDFSYNC_DDE_SERVICE, PDFSYNC_DDE_TOPIC, cmd.Get());
 }
@@ -401,15 +402,19 @@ static HWND FindPrevInstWindow(HANDLE* hMutex) {
     AutoFreeWstr mapId = str::Format(L"SumatraPDF-%08x", hash);
 
     int retriesLeft = 3;
+    HANDLE hMap = nullptr;
 Retry:
     // use a memory mapping containing a process id as mutex
-    HANDLE hMap = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(DWORD), mapId);
-    if (!hMap)
+    hMap = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(DWORD), mapId);
+    if (!hMap) {
         goto Error;
-    bool hasPrevInst = GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+    DWORD lastErr = GetLastError();
+    bool hasPrevInst = (lastErr == ERROR_ALREADY_EXISTS);
     DWORD* procId = (DWORD*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD));
     if (!procId) {
         CloseHandle(hMap);
+        hMap = nullptr;
         goto Error;
     }
     if (!hasPrevInst) {
@@ -580,38 +585,43 @@ static void UpdateGlobalPrefs(const CommandLineInfo& i) {
     }
 }
 
-// we're in installer mode if the name of the executable
-// has "install" string in it e.g. SumatraPDF-installer.exe
-static bool HasNameOfInstaller() {
-    WCHAR* exePath = GetExePath();
+static bool ExeHasNameOfRaMicro() {
+    AutoFreeWstr exePath = GetExePath();
     const WCHAR* exeName = path::GetBaseNameNoFree(exePath);
-    bool isInstaller = str::FindI(exeName, L"install");
-    str::Free(exePath);
-    return isInstaller;
+    return str::FindI(exeName, L"ramicro");
 }
 
-static bool HasInstallerResources() {
+// we're in installer mode if the name of the executable
+// has "install" string in it e.g. SumatraPDF-installer.exe
+static bool ExeHasNameOfInstaller() {
+    AutoFreeWstr exePath = GetExePath();
+    const WCHAR* exeName = path::GetBaseNameNoFree(exePath);
+    return str::FindI(exeName, L"install");
+}
+
+static bool ExeHasInstallerResources() {
     HRSRC resSrc = FindResource(GetModuleHandle(nullptr), MAKEINTRESOURCEW(1), RT_RCDATA);
     return resSrc != nullptr;
 }
 
 static bool IsInstallerAndNamedAsSuch() {
-    if (!HasInstallerResources()) {
+    if (!ExeHasInstallerResources()) {
         return false;
     }
-    return HasNameOfInstaller();
+    return ExeHasNameOfInstaller();
 }
 
+// if we can load "libmupdf.dll" this is likely an installed executable
 static bool SeemsInstalled() {
     HMODULE h = LoadLibraryW(L"libmupdf.dll");
     return h != nullptr;
 }
 
 static bool IsInstallerButNotInstalled() {
-    if (!HasInstallerResources()) {
+    if (!ExeHasInstallerResources()) {
         return false;
     }
-    if (HasNameOfInstaller()) {
+    if (ExeHasNameOfInstaller()) {
         return true;
     }
     if (SeemsInstalled()) {
@@ -726,6 +736,15 @@ static void LogDpiAwareness() {
 }
 #endif
 
+static void testLogf() {
+    const char* fileName = path::GetBaseNameNoFree(__FILE__);
+    WCHAR* gswin32c = L"this is a path";
+    WCHAR* tmpFile = L"c:\foo\bar.txt";
+    AutoFree gswin = strconv::WstrToUtf8(gswin32c);
+    AutoFree tmpFileName = strconv::WstrToUtf8(path::GetBaseNameNoFree(tmpFile));
+    logf("- %s:%d: using '%s' for creating '%%TEMP%%\\%s'\n", fileName, __LINE__, gswin.get(), tmpFileName.get());
+}
+
 int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR cmdLine,
                      _In_ int nCmdShow) {
     UNUSED(hPrevInstance);
@@ -775,6 +794,8 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 
     log("Starting SumatraPDF\n");
 
+    testLogf();
+
     // LogDpiAwareness();
 
     // TODO: temporary, to test crash reporting
@@ -795,6 +816,13 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
         }
     }
 
+    if (i.ramicro) {
+        gIsRaMicroBuild = true;
+    }
+    if (ExeHasNameOfRaMicro()) {
+        gIsRaMicroBuild = true;
+    }
+
     if (i.showHelp && IsInstallerButNotInstalled()) {
         ShowInstallerHelp();
         return 0;
@@ -806,7 +834,7 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
     }
 
     if ((i.install || i.justExtractFiles) || IsInstallerAndNamedAsSuch()) {
-        if (!HasInstallerResources()) {
+        if (!ExeHasInstallerResources()) {
             ShowNotValidInstallerError();
             return 1;
         }
@@ -866,6 +894,14 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
         // TODO(port)
         // fz_redirect_dll_io_to_console();
     }
+
+    if (i.testApp) {
+        // in TestApp.cpp
+        extern void TestApp(HINSTANCE hInstance);
+        TestApp(hInstance);
+        return 0;
+    }
+
     if (i.registerAsDefault) {
         AssociateExeWithPdfExtension();
     }
@@ -1086,6 +1122,9 @@ Exit:
     DeleteCachedCursors();
     DeleteObject(GetDefaultGuiFont());
     DeleteBitmap(gBitmapReloadingCue);
+
+    extern void CleanupDjVuEngine(); // in EngineDjVu.cpp
+    CleanupDjVuEngine();
 
     // wait for FileExistenceChecker to terminate
     // (which should be necessary only very rarely)

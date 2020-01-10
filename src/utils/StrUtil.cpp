@@ -251,6 +251,13 @@ bool StartsWithI(const char* s, const char* txt) {
     return 0 == _strnicmp(s, txt, str::Len(txt));
 }
 
+bool Contains(std::string_view s, const char* txt) {
+    // TODO: needs to respect s.size()
+    const char* p = str::Find(s.data(), txt);
+    bool contains = p != nullptr;
+    return contains;
+}
+
 bool EndsWith(const char* txt, const char* end) {
     if (!txt || !end)
         return false;
@@ -426,34 +433,44 @@ const char* Find(const char* str, const char* find) {
 bool BufFmtV(char* buf, size_t bufCchSize, const char* fmt, va_list args) {
     int count = vsnprintf(buf, bufCchSize, fmt, args);
     buf[bufCchSize - 1] = 0;
-    if ((count >= 0) && ((size_t)count < bufCchSize))
+    if ((count >= 0) && ((size_t)count < bufCchSize)) {
         return true;
+    }
     return false;
 }
 
+// TODO: need to finish StrFormat and use it instead.
 char* FmtV(const char* fmt, va_list args) {
-    char message[256];
+    char message[256] = {0};
     size_t bufCchSize = dimof(message);
     char* buf = message;
     for (;;) {
         int count = vsnprintf(buf, bufCchSize, fmt, args);
-        if ((count >= 0) && ((size_t)count < bufCchSize))
+        // happened in https://github.com/sumatrapdfreader/sumatrapdf/issues/878
+        // when %S string had certain Unicode characters
+        CrashIf(count == -1);
+        if ((count >= 0) && ((size_t)count < bufCchSize)) {
             break;
+        }
         /* we have to make the buffer bigger. The algorithm used to calculate
            the new size is arbitrary (aka. educated guess) */
-        if (buf != message)
+        if (buf != message) {
             free(buf);
-        if (bufCchSize < 4 * 1024)
+        }
+        if (bufCchSize < 4 * 1024) {
             bufCchSize += bufCchSize;
-        else
+        } else {
             bufCchSize += 1024;
+        }
         buf = AllocArray<char>(bufCchSize);
-        if (!buf)
+        if (!buf) {
             break;
+        }
     }
 
-    if (buf == message)
+    if (buf == message) {
         buf = str::Dup(message);
+    }
 
     return buf;
 }
@@ -523,8 +540,9 @@ size_t TrimWS(char* s, TrimOpt opt) {
 
 // the result needs to be free()d
 char* Replace(const char* s, const char* toReplace, const char* replaceWith) {
-    if (!s || str::IsEmpty(toReplace) || !replaceWith)
+    if (!s || str::IsEmpty(toReplace) || !replaceWith) {
         return nullptr;
+    }
 
     str::Str result(str::Len(s));
     size_t findLen = str::Len(toReplace), replLen = str::Len(replaceWith);
@@ -555,8 +573,9 @@ size_t NormalizeWS(char* str) {
         }
     }
 
-    if (dst > str && IsWs(*(dst - 1)))
+    if (dst > str && IsWs(*(dst - 1))) {
         dst--;
+    }
     *dst = '\0';
 
     return src - dst;
@@ -578,8 +597,9 @@ size_t NormalizeNewlinesInPlace(char* s, char* e) {
     bool inNewline = false;
     while (s < e) {
         if (isNl(*s)) {
-            if (!inNewline)
+            if (!inNewline) {
                 *dst++ = '\n';
+            }
             inNewline = true;
             ++s;
         } else {
@@ -734,42 +754,48 @@ static const char* ParseV(const char* str, const char* format, va_list args) {
         f++;
 
         const char* end = nullptr;
-        if ('u' == *f)
+        if ('u' == *f) {
             *va_arg(args, unsigned int*) = strtoul(str, (char**)&end, 10);
-        else if ('d' == *f)
+        } else if ('d' == *f) {
             *va_arg(args, int*) = strtol(str, (char**)&end, 10);
-        else if ('x' == *f)
+        } else if ('x' == *f) {
             *va_arg(args, unsigned int*) = strtoul(str, (char**)&end, 16);
-        else if ('f' == *f)
+        } else if ('f' == *f) {
             *va_arg(args, float*) = (float)strtod(str, (char**)&end);
-        else if ('c' == *f)
+        } else if ('g' == *f) {
+            *va_arg(args, float*) = (float)strtod(str, (char**)&end);
+        } else if ('c' == *f)
             *va_arg(args, char*) = *str, end = str + 1;
-        else if ('s' == *f)
+        else if ('s' == *f) {
             *va_arg(args, char**) = ExtractUntil(str, *(f + 1), &end);
-        else if ('S' == *f)
+        } else if ('S' == *f) {
             va_arg(args, AutoFree*)->Set(ExtractUntil(str, *(f + 1), &end));
-        else if ('$' == *f && !*str)
+        } else if ('$' == *f && !*str) {
             continue; // don't fail, if we're indeed at the end of the string
-        else if ('%' == *f && *f == *str)
+        } else if ('%' == *f && *f == *str) {
             end = str + 1;
-        else if (' ' == *f && str::IsWs(*str))
+        } else if (' ' == *f && str::IsWs(*str)) {
             end = str + 1;
-        else if ('_' == *f) {
-            if (!str::IsWs(*str))
+        } else if ('_' == *f) {
+            if (!str::IsWs(*str)) {
                 continue; // don't fail, if there's no whitespace at all
+            }
             for (end = str + 1; str::IsWs(*end); end++) {
                 // do nothing
             }
         } else if ('?' == *f && *(f + 1)) {
             // skip the next format character, advance the string,
             // if it the optional character is the next character to parse
-            if (*str != *++f)
+            if (*str != *++f) {
                 continue;
+            }
             end = (char*)str + 1;
-        } else if (str::IsDigit(*f))
+        } else if (str::IsDigit(*f)) {
             f = ParseLimitedNumber(str, f, &end, va_arg(args, void*)) - 1;
-        if (!end || end == str)
+        }
+        if (!end || end == str) {
             return nullptr;
+        }
         str = end;
     }
     return str;

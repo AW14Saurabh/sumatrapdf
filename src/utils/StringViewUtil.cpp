@@ -6,6 +6,31 @@
 // utilities for string view
 namespace sv {
 
+ParsedKV::~ParsedKV() {
+    free(key);
+    free(val);
+}
+
+static void parsedKVMove(ParsedKV* t, ParsedKV* that) noexcept {
+    if (t == that) {
+        return;
+    }
+    t->ok = that->ok;
+    t->key = that->key;
+    t->val = that->val;
+    that->key = nullptr;
+    that->val = nullptr;
+}
+
+ParsedKV& ParsedKV::operator=(ParsedKV&& that) noexcept {
+    parsedKVMove(this, &that);
+    return *this;
+}
+
+ParsedKV::ParsedKV(ParsedKV&& that) noexcept {
+    parsedKVMove(this, &that);
+}
+
 bool StartsWith(std::string_view s, std::string_view prefix) {
     auto plen = prefix.length();
     auto slen = s.length();
@@ -20,6 +45,8 @@ bool StartsWith(std::string_view s, const char* prefix) {
     return StartsWith(s, p);
 }
 
+// returns a copy of <s> where newlines are normalized to LF ('\n')
+// TODO: optimize
 std::string_view NormalizeNewlines(std::string_view s) {
     str::Str tmp(s);
     tmp.Replace("\r\n", "\n");
@@ -142,22 +169,6 @@ std::string_view ParseUntilBack(std::string_view& sv, char delim) {
     return el;
 }
 
-// sv is "key: value"
-// returns value if key is <key>
-std::string_view ParseKV(std::string_view sv, const char* key) {
-    auto parts = sv::Split(sv, ':', 2);
-    if (parts.size() == 1) {
-        return {};
-    }
-    auto k = parts[0];
-    if (!str::EqI(k, key)) {
-        return {};
-    }
-    auto v = parts[1];
-    v = sv::TrimSpace(v);
-    return v;
-}
-
 // skips all c chars in the beginning of sv
 // returns number of chars skipped
 // TODO: rename trimLeft?
@@ -173,7 +184,7 @@ size_t SkipChars(std::string_view& sv, char c) {
     return SkipTo(sv, s);
 }
 
-bool NeedsQuoting(char c) {
+static bool CharNeedsQuoting(char c) {
     switch (c) {
         case '"':
         case '\\':
@@ -183,6 +194,19 @@ bool NeedsQuoting(char c) {
         case '\b':
         case '\f':
             return true;
+    }
+    return false;
+}
+
+static bool NeedsQuoting(std::string_view sv) {
+    const char* s = sv.data();
+    const char* end = s + sv.size();
+    while (s < end) {
+        char c = *s;
+        if (c == ' ' || CharNeedsQuoting(c)) {
+            return true;
+        }
+        s++;
     }
     return false;
 }
@@ -207,32 +231,37 @@ static char quoteChar(char c) {
     return c;
 }
 
-static std::tuple<char, bool> unquoteChar(char c) {
+static bool unquoteChar(char& c) {
     switch (c) {
         case '"':
         case '\\':
-            return {c, true};
+            return true;
         case 'n':
-            return {'\n', true};
+            c = '\n';
+            return true;
         case 'r':
-            return {'\r', true};
+            c = '\r';
+            return true;
         case 't':
-            return {'\t', true};
+            c = '\t';
+            return true;
         case 'b':
-            return {'\b', true};
+            c = '\b';
+            return true;
         case 'f':
-            return {'\f', true};
+            c = '\f';
+            return true;
     }
-    return {'\0', false};
+    return false;
 }
 
-void AppendQuotedString(std::string_view sv, str::Str& out) {
+void AppendQuoted(std::string_view sv, str::Str& out) {
     out.AppendChar('"');
     const char* s = sv.data();
     const char* end = s + sv.size();
     while (s < end) {
         auto c = *s;
-        if (NeedsQuoting(c)) {
+        if (CharNeedsQuoting(c)) {
             out.AppendChar('\\');
             c = quoteChar(c);
         }
@@ -242,22 +271,36 @@ void AppendQuotedString(std::string_view sv, str::Str& out) {
     out.AppendChar('"');
 }
 
-// if <line> starts with '"' it's quoted value that should end with '"'
+bool AppendMaybeQuoted(std::string_view sv, str::Str& out) {
+    if (NeedsQuoting(sv)) {
+        AppendQuoted(sv, out);
+        return true;
+    }
+    out.AppendView(sv);
+    return false;
+}
+
+// if <sv> starts with '"' it's quoted value that should end with '"'
 // otherwise it's unquoted value that ends with ' '
 // returns false if starts with '"' but doesn't end with '"'
 // sets <out> to parsed value
-// updates <line> to consume parsed characters
-bool ParseQuotedString(std::string_view& line, str::Str& out) {
-    if (line.size() == 0) {
+// updates <sv> to consume parsed characters
+bool ParseMaybeQuoted(std::string_view& sv, str::Str& out, bool full) {
+    if (sv.size() == 0) {
         // empty value is ok
         return true;
     }
-    const char* s = line.data();
-    const char* end = s + line.size();
+    const char* s = sv.data();
+    const char* end = s + sv.size();
     char c = *s;
     if (c != '"') {
-        // unqoted
-        std::string_view v = sv::ParseUntil(line, ' ');
+        // unqoted, parse until end of line or end of text
+        if (full) {
+            std::string_view v = ParseUntil(sv, '\n');
+            out.AppendView(v);
+            return true;
+        }
+        std::string_view v = ParseUntil(sv, ' ');
         out.AppendView(v);
         return true;
     }
@@ -266,7 +309,7 @@ bool ParseQuotedString(std::string_view& line, str::Str& out) {
         c = *s;
         if (c == '"') {
             s++;
-            SkipTo(line, s);
+            SkipTo(sv, s);
             return true;
         }
         if (c != '\\') {
@@ -274,15 +317,16 @@ bool ParseQuotedString(std::string_view& line, str::Str& out) {
             s++;
             continue;
         }
-        // possibly escaping
+        // possibly un-quoting
         s++;
         if (s >= end) {
+            // TODO: allow it?
             return false;
         }
         c = *s;
-        auto [c2, ok] = unquoteChar(c);
-        if (ok) {
-            out.AppendChar(c2);
+        bool unquoted = unquoteChar(c);
+        if (unquoted) {
+            out.AppendChar(c);
         } else {
             out.AppendChar('\\');
             out.AppendChar(c);
@@ -291,6 +335,58 @@ bool ParseQuotedString(std::string_view& line, str::Str& out) {
     }
     // started with '"' but didn't end with it
     return false;
+}
+
+// find key (':', ' ' or end of text) in <sv>
+static std::string_view parseKey(std::string_view& sv) {
+    sv::SkipChars(sv, ' ');
+    const char* s = sv.data();
+    const char* end = s + sv.size();
+
+    const char* keyStart = s;
+    const char* keyEnd = end;
+    while (s < end) {
+        char c = *s;
+        if (c == ':' || c == ' ') {
+            keyEnd = s;
+            s++;
+            break;
+        }
+        s++;
+    }
+    size_t keySize = (keyEnd - keyStart);
+    sv::SkipTo(sv, s);
+    sv::SkipChars(sv, ' ');
+    return {keyStart, keySize};
+}
+
+// <str> could be:
+// "key"
+// "key:unquoted-value"
+// "key:"quoted value"
+// updates <str> in place to account for parsed data
+ParsedKV ParseKV(std::string_view& sv, bool full) {
+    ParsedKV res;
+    std::string_view key = parseKey(sv);
+    if (key.empty()) {
+        res.ok = false;
+        return res;
+    }
+    res.key = str::Dup(key);
+
+    str::Str val;
+    res.ok = ParseMaybeQuoted(sv, val, full);
+    res.val = val.StealData();
+    return res;
+}
+
+// parse key/value out of <s>, expecting a given <key>
+ParsedKV ParseValueOfKey(std::string_view& str, std::string_view key, bool full) {
+    ParsedKV res = ParseKV(str, full);
+    if (res.ok) {
+        res.ok = str::Eq(key, res.key);
+    }
+    return res;
 }
 
 } // namespace sv

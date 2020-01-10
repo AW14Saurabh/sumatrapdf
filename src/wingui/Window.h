@@ -6,14 +6,19 @@ struct WindowBase;
 struct Window;
 
 struct WndProcArgs {
-    WindowBase* w = nullptr;
+    // args sent to WndProc
     HWND hwnd = nullptr;
     UINT msg = 0;
     WPARAM wparam = 0;
     LPARAM lparam = 0;
 
+    // indicate if we handled the message and the result (if handled)
     bool didHandle = false;
     LRESULT result = 0;
+
+    // window that logically received the message
+    // (we reflect messages sent to parent windows back to real window)
+    WindowBase* w = nullptr;
 };
 
 #define SetWndProcArgs(n) \
@@ -27,44 +32,32 @@ struct WndProcArgs {
 
 typedef std::function<void(WndProcArgs*)> MsgFilter;
 
-struct SizeArgs {
-    WindowBase* w = nullptr;
-    HWND hwnd = nullptr;
+struct SizeArgs : WndProcArgs {
     int dx = 0;
     int dy = 0;
-
-    WPARAM wparam = 0; // resize type
-    LPARAM lparam = 0;
-
-    bool didHandle = false;
 };
 
-typedef std::function<void(SizeArgs*)> OnSize;
+typedef std::function<void(SizeArgs*)> SizeHandler;
 
-struct ContextMenuArgs {
-    WndProcArgs* procArgs = nullptr;
-    WindowBase* w = nullptr;
-
+struct ContextMenuArgs : WndProcArgs {
     // mouse x,y position relative to the window
     PointI mouseWindow{};
     // global (screen) mouse x,y position
     PointI mouseGlobal{};
 };
 
-typedef std::function<void(ContextMenuArgs*)> OnContextMenu;
+typedef std::function<void(ContextMenuArgs*)> ContextMenuHandler;
 
-struct WindowCloseArgs {
-    Window* window = nullptr;
+struct WindowCloseArgs : WndProcArgs {
     bool cancel = false;
 };
 
-typedef std::function<void(WindowCloseArgs*)> OnClose;
-
-struct WindowDestroyedArgs {
-    Window* window = nullptr;
+struct WmCommandArgs : WndProcArgs {
+    int id = 0;
+    int ev = 0;
 };
 
-typedef std::function<void(WindowDestroyedArgs*)> OnDestroyed;
+typedef std::function<void(WmCommandArgs*)> WmCommandHandler;
 
 extern Kind kindWindowBase;
 
@@ -93,8 +86,10 @@ struct WindowBase {
     // called at start of windows proc to allow intercepting messages
     MsgFilter msgFilter;
 
-    // called to process WM_CONTEXTMENU
-    OnContextMenu onContextMenu = nullptr;
+    // allow handling WM_CONTEXTMENU
+    ContextMenuHandler onContextMenu = nullptr;
+    // allow handling WM_SIZE
+    SizeHandler onSize = nullptr;
 
     COLORREF textColor = ColorUnset;
     COLORREF backgroundColor = ColorUnset;
@@ -144,15 +139,26 @@ struct WindowBase {
     void SetRtl(bool);
 };
 
+typedef std::function<void(WindowCloseArgs*)> CloseHandler;
+
+struct WindowDestroyArgs : WndProcArgs {
+    Window* window = nullptr;
+};
+
+typedef std::function<void(WindowDestroyArgs*)> DestroyHandler;
+
 extern Kind kindWindow;
 
 // a top-level window. Must set winClass before
 // calling Create()
 struct Window : public WindowBase {
-    OnWmCommand onWmCommand = nullptr;
-    OnSize onSize = nullptr;
-    OnClose onClose = nullptr;
-    OnDestroyed onDestroyed = nullptr;
+    // TODO: move to WindowBase?
+    // for WM_COMMAND
+    WmCommandHandler onWmCommand = nullptr;
+    // for WM_NCDESTROY
+    DestroyHandler onDestroy = nullptr;
+
+    CloseHandler onClose = nullptr;
 
     Window();
     ~Window() override;
@@ -171,8 +177,8 @@ struct WindowBaseLayout : public ILayout {
     ~WindowBaseLayout() override;
 
     Size Layout(const Constraints bc) override;
-    Length MinIntrinsicHeight(Length) override;
-    Length MinIntrinsicWidth(Length) override;
+    i32 MinIntrinsicHeight(i32) override;
+    i32 MinIntrinsicWidth(i32) override;
     void SetBounds(const Rect bounds) override;
 };
 

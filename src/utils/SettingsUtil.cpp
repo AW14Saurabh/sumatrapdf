@@ -430,7 +430,7 @@ static void SerializeStructRec(str::Str& out, const StructInfo* info, const void
         CrashIf(str::FindChar(fieldName, '=') || str::FindChar(fieldName, ':') || str::FindChar(fieldName, '[') ||
                 str::FindChar(fieldName, ']') || NeedsEscaping(fieldName));
         if (Type_Struct == field.type || Type_Prerelease == field.type) {
-#if !(defined(SVN_PRE_RELEASE_VER) || defined(DEBUG))
+#if !(defined(PRE_RELEASE_VER) || defined(DEBUG))
             if (Type_Prerelease == field.type)
                 continue;
 #endif
@@ -490,7 +490,7 @@ static void* DeserializeStructRec(const StructInfo* info, SquareTreeNode* node, 
         uint8_t* fieldPtr = base + field.offset;
         if (Type_Struct == field.type || Type_Prerelease == field.type) {
             SquareTreeNode* child = node ? node->GetChild(fieldName) : nullptr;
-#if !(defined(SVN_PRE_RELEASE_VER) || defined(DEBUG))
+#if !(defined(PRE_RELEASE_VER) || defined(DEBUG))
             if (Type_Prerelease == field.type)
                 child = nullptr;
 #endif
@@ -544,9 +544,11 @@ static void FreeStructData(const StructInfo* info, uint8_t* base) {
         } else if (Type_Array == field.type) {
             FreeArray(*(Vec<void*>**)fieldPtr, field);
         } else if (Type_String == field.type || Type_Utf8String == field.type) {
-            free(*(void**)fieldPtr);
+            void* m = *((void**)fieldPtr);
+            free(m);
         } else if (Type_ColorArray == field.type || Type_FloatArray == field.type || Type_IntArray == field.type) {
-            delete *(Vec<int>**)fieldPtr;
+            Vec<int>* v = *((Vec<int>**)fieldPtr);
+            delete v;
         } else if (Type_StringArray == field.type) {
             FreeStringArray(*(Vec<WCHAR*>**)fieldPtr);
         }

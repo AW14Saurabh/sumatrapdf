@@ -197,11 +197,8 @@ class XpsEngineImpl : public EngineBase {
     RectD PageMediabox(int pageNo) override;
     RectD PageContentBox(int pageNo, RenderTarget target = RenderTarget::View) override;
 
-    RenderedBitmap* RenderBitmap(int pageNo, float zoom, int rotation,
-                                 RectD* pageRect = nullptr, /* if nullptr: defaults to the page's mediabox */
-                                 RenderTarget target = RenderTarget::View, AbortCookie** cookie_out = nullptr) override;
+    RenderedBitmap* RenderPage(RenderPageArgs& args) override;
 
-    PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false) override;
     RectD Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse = false) override;
 
     std::string_view GetFileData() override;
@@ -210,7 +207,6 @@ class XpsEngineImpl : public EngineBase {
     bool HasClipOptimizations(int pageNo) override;
     WCHAR* GetProperty(DocumentProperty prop) override;
 
-    bool SupportsAnnotation(bool forSaving = false) const override;
     void UpdateUserAnnotations(Vec<PageAnnotation>* list) override;
 
     RenderedBitmap* GetImageForPageElement(PageElement*) override;
@@ -223,7 +219,7 @@ class XpsEngineImpl : public EngineBase {
     PageElement* GetElementAtPos(int pageNo, PointD pt) override;
 
     PageDestination* GetNamedDest(const WCHAR* name) override;
-    DocTocTree* GetTocTree() override;
+    TocTree* GetToc() override;
 
     static EngineBase* CreateFromFile(const WCHAR* fileName);
     static EngineBase* CreateFromStream(IStream* stream);
@@ -246,7 +242,7 @@ class XpsEngineImpl : public EngineBase {
 
     Vec<PageAnnotation> userAnnots;
 
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
 
     bool Load(const WCHAR* fileName);
     bool Load(IStream* stream);
@@ -266,7 +262,7 @@ class XpsEngineImpl : public EngineBase {
         return fz_create_view_ctm(r, zoom, rotation);
     }
 
-    DocTocItem* BuildTocTree(DocTocItem* parent, fz_outline* entry, int& idCounter);
+    TocItem* BuildTocTree(TocItem* parent, fz_outline* entry, int& idCounter);
     RenderedBitmap* GetPageImage(int pageNo, RectD rect, size_t imageIx);
     WCHAR* ExtractFontList();
 };
@@ -294,6 +290,8 @@ XpsEngineImpl::XpsEngineImpl() {
     kind = kindEngineXps;
     defaultFileExt = L".xps";
     fileDPI = 72.0f;
+    supportsAnnotations = true;
+    supportsAnnotationsForSaving = false;
 
     for (size_t i = 0; i < dimof(mutexes); i++) {
         InitializeCriticalSection(&mutexes[i]);
@@ -598,15 +596,6 @@ RectD XpsEngineImpl::PageContentBox(int pageNo, RenderTarget target) {
     return rect2.Intersect(mediabox);
 }
 
-PointD XpsEngineImpl::Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
-    fz_matrix ctm = viewctm(pageNo, zoom, rotation);
-    if (inverse)
-        ctm = fz_invert_matrix(ctm);
-    fz_point pt2 = {(float)pt.x, (float)pt.y};
-    pt2 = fz_transform_point(pt2, ctm);
-    return PointD(pt2.x, pt2.y);
-}
-
 RectD XpsEngineImpl::Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse) {
     fz_matrix ctm = viewctm(pageNo, zoom, rotation);
     if (inverse) {
@@ -617,9 +606,8 @@ RectD XpsEngineImpl::Transform(RectD rect, int pageNo, float zoom, int rotation,
     return fz_rect_to_RectD(rect2);
 }
 
-RenderedBitmap* XpsEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation, RectD* pageRect, RenderTarget target,
-                                            AbortCookie** cookie_out) {
-    FzPageInfo* pageInfo = GetFzPageInfo(pageNo);
+RenderedBitmap* XpsEngineImpl::RenderPage(RenderPageArgs& args) {
+    FzPageInfo* pageInfo = GetFzPageInfo(args.pageNo);
     fz_page* page = pageInfo->page;
     if (!page) {
         return nullptr;
@@ -627,9 +615,9 @@ RenderedBitmap* XpsEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation
 
     fz_cookie* fzcookie = nullptr;
     FitzAbortCookie* cookie = nullptr;
-    if (cookie_out) {
+    if (args.cookie_out) {
         cookie = new FitzAbortCookie();
-        *cookie_out = cookie;
+        *args.cookie_out = cookie;
         fzcookie = &cookie->cookie;
     }
 
@@ -637,13 +625,13 @@ RenderedBitmap* XpsEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation
     ScopedCritSec cs(ctxAccess);
 
     fz_rect pRect;
-    if (pageRect) {
-        pRect = RectD_to_fz_rect(*pageRect);
+    if (args.pageRect) {
+        pRect = RectD_to_fz_rect(*args.pageRect);
     } else {
         // TODO(port): use pageInfo->mediabox?
         pRect = fz_bound_page(ctx, page);
     }
-    fz_matrix ctm = viewctm(page, zoom, rotation);
+    fz_matrix ctm = viewctm(page, args.zoom, args.rotation);
     fz_irect bbox = fz_round_rect(fz_transform_rect(pRect, ctm));
 
     fz_colorspace* colorspace = fz_device_rgb(ctx);
@@ -658,7 +646,7 @@ RenderedBitmap* XpsEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation
     fz_var(pix);
     fz_var(bitmap);
 
-    Vec<PageAnnotation> pageAnnots = fz_get_user_page_annots(userAnnots, pageNo);
+    Vec<PageAnnotation> pageAnnots = fz_get_user_page_annots(userAnnots, args.pageNo);
 
     fz_try(ctx) {
         pix = fz_new_pixmap_with_bbox(ctx, colorspace, ibounds, nullptr, 1);
@@ -778,10 +766,6 @@ WCHAR* XpsEngineImpl::GetProperty(DocumentProperty prop) {
     }
 };
 
-bool XpsEngineImpl::SupportsAnnotation(bool forSaving) const {
-    return !forSaving; // for now
-}
-
 void XpsEngineImpl::UpdateUserAnnotations(Vec<PageAnnotation>* list) {
     // TODO: use a new critical section to avoid blocking the UI thread
     ScopedCritSec scope(ctxAccess);
@@ -871,9 +855,9 @@ PageDestination* XpsEngineImpl::GetNamedDest(const WCHAR* nameW) {
     return nullptr;
 }
 
-DocTocItem* XpsEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline, int& idCounter) {
-    DocTocItem* root = nullptr;
-    DocTocItem* curr = nullptr;
+TocItem* XpsEngineImpl::BuildTocTree(TocItem* parent, fz_outline* outline, int& idCounter) {
+    TocItem* root = nullptr;
+    TocItem* curr = nullptr;
 
     while (outline) {
         WCHAR* name = nullptr;
@@ -887,7 +871,7 @@ DocTocItem* XpsEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline,
         int pageNo = outline->page + 1;
         auto dest = newFzDestination(outline);
 
-        DocTocItem* item = newDocTocItemWithDestination(parent, name, dest);
+        TocItem* item = newTocItemWithDestination(parent, name, dest);
         free(name);
         item->isOpenDefault = outline->is_open;
         item->id = ++idCounter;
@@ -911,19 +895,17 @@ DocTocItem* XpsEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline,
     return root;
 }
 
-DocTocTree* XpsEngineImpl::GetTocTree() {
+TocTree* XpsEngineImpl::GetToc() {
     if (tocTree) {
         return tocTree;
     }
 
     int idCounter = 0;
-    DocTocItem* root = BuildTocTree(nullptr, _outline, idCounter);
+    TocItem* root = BuildTocTree(nullptr, _outline, idCounter);
     if (!root) {
         return nullptr;
     }
-    tocTree = new DocTocTree(root);
-    const char* path = strconv::WstrToUtf8(fileName).data();
-    tocTree->filePath = path;
+    tocTree = new TocTree(root);
     return tocTree;
 }
 

@@ -15,6 +15,7 @@
 #include "wingui/ButtonCtrl.h"
 
 #include "EngineBase.h"
+#include "EngineMulti.h"
 #include "EngineManager.h"
 
 #include "ParseBKM.h"
@@ -35,6 +36,7 @@ struct TocEditorWindow {
     ILayout* layoutButtons = nullptr;
 
     TreeCtrl* treeCtrl = nullptr;
+    TreeModel* treeModel = nullptr;
 
     bool canRemovePdf = false;
 
@@ -45,7 +47,9 @@ struct TocEditorWindow {
 };
 
 TocEditorWindow::~TocEditorWindow() {
-    delete treeCtrl->treeModel;
+    // TODO: delete the top but not children, because
+    // they are not owned
+    // delete treeModel;
 
     // deletes all controls owned by layout
     delete mainLayout;
@@ -78,7 +82,7 @@ void ShowErrorMessage(const char* msg) {
     MessageBoxA(hwnd, msg, "Error", MB_OK | MB_ICONERROR);
 }
 
-static void AddPageNumbersToTocItem(DocTocItem* ti) {
+static void AddPageNumbersToTocItem(TocItem* ti) {
     int sno = ti->pageNo;
     if (sno <= 0) {
         return;
@@ -94,7 +98,7 @@ static void AddPageNumbersToTocItem(DocTocItem* ti) {
     ti->title = s;
 }
 
-static void AddPageNumbersToTocItemsRecur(DocTocItem* ti) {
+static void AddPageNumbersToTocItemsRecur(TocItem* ti) {
     while (ti) {
         AddPageNumbersToTocItem(ti);
         AddPageNumbersToTocItemsRecur(ti->child);
@@ -102,71 +106,45 @@ static void AddPageNumbersToTocItemsRecur(DocTocItem* ti) {
     }
 }
 
-static void CollectTocItemsRecur(DocTocItem* ti, Vec<DocTocItem*>& v) {
-    while (ti) {
-        v.push_back(ti);
-        CollectTocItemsRecur(ti->child, v);
-        ti = ti->next;
-    }
-}
+static void UpdateTreeModel(TocEditorWindow* w) {
+    TreeCtrl* treeCtrl = w->treeCtrl;
+    treeCtrl->Clear();
 
-static bool cmpByPageNo(DocTocItem* ti1, DocTocItem* ti2) {
-    return ti1->pageNo < ti2->pageNo;
-}
+    // TODO: only delete the first levels because we keep reference to them
+    // delete w->treeModel;
+    w->treeModel = nullptr;
 
-static void CalcEndPageNo(DocTocItem* root, int nPages) {
-    Vec<DocTocItem*> tocItems;
-    CollectTocItemsRecur(root, tocItems);
-    size_t n = tocItems.size();
-    if (n < 1) {
-        return;
-    }
-    std::sort(tocItems.begin(), tocItems.end(), cmpByPageNo);
-    DocTocItem* prev = tocItems[0];
-    for (size_t i = 1; i < n; i++) {
-        DocTocItem* next = tocItems[i];
-        prev->endPageNo = next->pageNo;
-        prev = next;
-    }
-    prev->endPageNo = nPages;
-}
+    auto& bookmarks = w->tocArgs->bookmarks;
 
-static void UpdateTreeModel() {
-    TreeCtrl* treeCtrl = gWindow->treeCtrl;
-    auto& bookmarks = gWindow->tocArgs->bookmarks;
-    delete treeCtrl->treeModel;
-    treeCtrl->treeModel = nullptr;
-
-    DocTocItem* root = nullptr;
-    DocTocItem* curr = nullptr;
-    for (auto&& bkm : bookmarks) {
-        DocTocItem* i = new DocTocItem();
-        i->isOpenDefault = true;
-        i->child = CloneDocTocItemRecur(bkm->toc->root);
-        if (i->child) {
-            CalcEndPageNo(i->child, bkm->nPages);
-            AddPageNumbersToTocItemsRecur(i->child);
-            i->child->parent = i->child;
-        }
-        const char* filePath = bkm->filePath.get();
-        AutoFreeWstr path = strconv::Utf8ToWstr(filePath);
+    TocItem* root = nullptr;
+    TocItem* curr = nullptr;
+    for (auto&& vbkm : bookmarks) {
+        TocItem* ti = new TocItem();
+        ti->isOpenDefault = true;
+        AutoFreeWstr path = strconv::Utf8ToWstr(vbkm->filePath.as_view());
         const WCHAR* name = path::GetBaseNameNoFree(path);
-        i->title = str::Dup(name);
-        if (root == nullptr) {
-            root = i;
+        ti->title = str::Dup(name);
+        ti->child = vbkm->toc->root;
+        ti->child->parent = ti->child;
+
+        CalcEndPageNo(ti->child, vbkm->nPages);
+        AddPageNumbersToTocItemsRecur(ti->child);
+
+        if (!root) {
+            root = ti;
             curr = root;
         } else {
-            curr->next = i;
-            curr = i;
+            curr->next = ti;
+            curr = ti;
         }
     }
-    DocTocTree* tm = new DocTocTree();
-    tm->root = root;
-    treeCtrl->SetTreeModel(tm);
+    w->treeModel = new TocTree(root);
+    treeCtrl->SetTreeModel(w->treeModel);
 }
 
 static void AddPdf() {
-    HWND hwnd = gWindow->mainWindow->hwnd;
+    TocEditorWindow* w = gWindow;
+    HWND hwnd = w->mainWindow->hwnd;
 
     OPENFILENAME ofn = {0};
     ofn.lStructSize = sizeof(ofn);
@@ -188,27 +166,29 @@ static void AddPdf() {
         return;
     }
     WCHAR* filePath = ofn.lpstrFile;
+
     EngineBase* engine = EngineManager::CreateEngine(filePath);
     if (!engine) {
         ShowErrorMessage("Failed to open a file!");
         return;
     }
-    DocTocTree* tocTree = engine->GetTocTree();
+    TocTree* tocTree = engine->GetToc();
     if (nullptr == tocTree) {
         // TODO: maybe add a dummy entry for the first page
         // or make top-level act as first page destination
         ShowErrorMessage("File doesn't have Table of content");
         return;
     }
-    tocTree = CloneDocTocTree(tocTree);
+    tocTree = CloneTocTree(tocTree, false);
     int nPages = engine->PageCount();
     delete engine;
-    Bookmarks* bookmarks = new Bookmarks();
+    VbkmForFile* bookmarks = new VbkmForFile();
     bookmarks->toc = tocTree;
-    bookmarks->filePath = str::Dup(tocTree->filePath);
+    bookmarks->filePath = strconv::WstrToUtf8(filePath).data();
     bookmarks->nPages = nPages;
-    gWindow->tocArgs->bookmarks.push_back(bookmarks);
-    UpdateTreeModel();
+    w->tocArgs->bookmarks.push_back(bookmarks);
+
+    UpdateTreeModel(w);
 }
 
 static void RemovePdf() {
@@ -218,13 +198,13 @@ static void RemovePdf() {
     size_t n = w->tocArgs->bookmarks.size();
     CrashIf(n < 2);
 
-    DocTocItem* di = (DocTocItem*)sel;
+    TocItem* di = (TocItem*)sel;
     CrashIf(di->Parent() != nullptr);
     WCHAR* toRemoveTitle = di->title;
     size_t toRemoveIdx = 0;
-    Bookmarks* bkmToRemove = nullptr;
+    VbkmForFile* bkmToRemove = nullptr;
     for (size_t i = 0; i < n; i++) {
-        Bookmarks* bkm = w->tocArgs->bookmarks[i];
+        VbkmForFile* bkm = w->tocArgs->bookmarks[i];
 
         AutoFreeWstr path = strconv::Utf8ToWstr(bkm->filePath.get());
         const WCHAR* name = path::GetBaseNameNoFree(path);
@@ -237,14 +217,14 @@ static void RemovePdf() {
     CrashIf(!bkmToRemove);
     w->tocArgs->bookmarks.RemoveAt(toRemoveIdx);
     delete bkmToRemove;
-    UpdateTreeModel();
+    UpdateTreeModel(w);
 }
 
 static void UpdateRemovePdfButtonStatus(TocEditorWindow* w) {
     TreeItem* sel = w->treeCtrl->GetSelection();
     bool isEnabled = false;
     if (sel) {
-        DocTocItem* di = (DocTocItem*)sel;
+        TocItem* di = (TocItem*)sel;
         TreeItem* p = di->Parent();
         isEnabled = (p == nullptr); // enabled if top-level
     }
@@ -263,13 +243,17 @@ static void SaveVirtual() {
     char* path = tocArgs->bookmarks[0]->filePath;
 
     str::WStr pathw = strconv::Utf8ToWstr(path);
-    pathw.Append(L".vbkm");
-    WCHAR dstFileName[MAX_PATH];
+    // if the source was .vbkm file, we over-write it by default
+    // any other format, we add .vbkm extension by default
+    if (!str::EndsWithI(path, ".vbkm")) {
+        pathw.Append(L".vbkm");
+    }
+    WCHAR dstFileName[MAX_PATH]{0};
     str::BufSet(&(dstFileName[0]), dimof(dstFileName), pathw.Get());
 
     HWND hwnd = gWindow->mainWindow->hwnd;
 
-    OPENFILENAME ofn = {0};
+    OPENFILENAME ofn{0};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFile = dstFileName;
@@ -287,11 +271,11 @@ static void SaveVirtual() {
         return;
     }
     AutoFree patha = strconv::WstrToUtf8(dstFileName);
-    ok = ExportBookmarksToFile(tocArgs->bookmarks, patha);
+    ok = ExportBookmarksToFile(tocArgs->bookmarks, "", patha);
     if (!ok) {
         return;
     }
-    ShowExportedBookmarksMsg(patha);
+    // ShowExportedBookmarksMsg(patha);
 }
 
 static void Exit() {
@@ -379,14 +363,17 @@ void TocEditorWindow::OnWindowSize(SizeArgs* args) {
     args->didHandle = true;
 }
 
-static void OnWindowDestroyed(WindowDestroyedArgs*) {
+static void OnWindowDestroyed(WindowDestroyArgs*) {
     delete gWindow;
     gWindow = nullptr;
 }
 
 void TocEditorWindow::OnTreeItemChanged(TreeItemChangedArgs* args) {
-    UNUSED(args);
-    logf("onTreeItemChanged\n");
+    if (!args->checkedChanged) {
+        return;
+    }
+    TocItem* ti = (TocItem*)args->treeItem;
+    ti->isUnchecked = !args->newState.isChecked;
 }
 
 void TocEditorWindow::OnTreeItemSelected(TreeSelectionChangedArgs* args) {
@@ -425,7 +412,7 @@ static void PositionCloseTo(WindowBase* w, HWND hwnd) {
 void StartTocEditor(TocEditorArgs* args) {
     if (gWindow != nullptr) {
         // TODO: maybe allow multiple windows
-        gWindow->mainWindow->onDestroyed = nullptr;
+        gWindow->mainWindow->onDestroy = nullptr;
         delete gWindow;
         gWindow = nullptr;
     }
@@ -435,7 +422,7 @@ void StartTocEditor(TocEditorArgs* args) {
     auto w = new Window();
     w->backgroundColor = MkRgb((u8)0xee, (u8)0xee, (u8)0xee);
     w->SetTitle("Table of content editor");
-    w->initialSize = {640, 2048};
+    w->initialSize = {640, 800};
     PositionCloseTo(w, args->hwndRelatedTo);
     SIZE winSize = {w->initialSize.Width, w->initialSize.Height};
     LimitWindowSizeToScreen(args->hwndRelatedTo, winSize);
@@ -450,13 +437,13 @@ void StartTocEditor(TocEditorArgs* args) {
 
     using namespace std::placeholders;
     w->onSize = std::bind(&TocEditorWindow::OnWindowSize, gWindow, _1);
-    w->onDestroyed = OnWindowDestroyed;
+    w->onDestroy = OnWindowDestroyed;
 
     gWindow->treeCtrl->onTreeItemChanged = std::bind(&TocEditorWindow::OnTreeItemChanged, gWindow, _1);
     gWindow->treeCtrl->onTreeItemCustomDraw = OnDocTocCustomDraw;
     gWindow->treeCtrl->onTreeSelectionChanged = std::bind(&TocEditorWindow::OnTreeItemSelected, gWindow, _1);
 
-    UpdateTreeModel();
+    UpdateTreeModel(gWindow);
     // important to call this after hooking up onSize to ensure
     // first layout is triggered
     w->SetIsVisible(true);

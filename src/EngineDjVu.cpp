@@ -14,6 +14,7 @@
 #include "utils/ScopedWin.h"
 #include "utils/Log.h"
 
+#include "SumatraConfig.h"
 #include "wingui/TreeModel.h"
 #include "EngineBase.h"
 #include "EngineDjVu.h"
@@ -36,30 +37,55 @@ static bool IsPageLink(const char* link) {
 //   http://example.net/#hyperlink
 static PageDestination* newDjVuDestination(const char* link) {
     auto res = new PageDestination();
+    res->rect = RectD(DEST_USE_DEFAULT, DEST_USE_DEFAULT, DEST_USE_DEFAULT, DEST_USE_DEFAULT);
 
-    if (IsPageLink(link)) {
-        res->kind = kindDestinationScrollTo;
-        res->pageNo = atoi(link + 1);
+    if (str::IsEmpty(link)) {
+        res->kind = kindDestinationNone;
+        return res;
+    }
+
+    // invalid but seen in a crash report
+    if (str::Eq(link, "#")) {
+        res->kind = kindDestinationNone;
+        return res;
     }
 
     if (str::Eq(link, "#+1")) {
         res->kind = kindDestinationNextPage;
+        return res;
     }
 
     if (str::Eq(link, "#-1")) {
         res->kind = kindDestinationPrevPage;
+        return res;
+    }
+
+    if (IsPageLink(link)) {
+        res->kind = kindDestinationScrollTo;
+        res->pageNo = atoi(link + 1);
+        return res;
     }
 
     if (str::StartsWithI(link, "http:") || str::StartsWithI(link, "https:") || str::StartsWithI(link, "mailto:")) {
         res->kind = kindDestinationLaunchURL;
         res->value = strconv::Utf8ToWstr(link);
+        return res;
     }
+
+    // very lenient heuristic
+    bool couldBeURL = str::Contains(link, ".");
+    if (couldBeURL) {
+        res->kind = kindDestinationLaunchURL;
+        res->value = strconv::Utf8ToWstr(link);
+        return res;
+    }
+
     if (!res->kind) {
-        logf("link: '%s'\n", link);
+        logf("unsupported djvu link: '%s'\n", link);
         CrashIf(!res->kind);
     }
 
-    res->rect = RectD(DEST_USE_DEFAULT, DEST_USE_DEFAULT, DEST_USE_DEFAULT, DEST_USE_DEFAULT);
+    res->kind = kindDestinationNone;
     return res;
 }
 
@@ -82,56 +108,67 @@ static PageElement* newDjVuLink(int pageNo, RectI rect, const char* link, const 
     return res;
 }
 
-static DocTocItem* newDjVuTocItem(DocTocItem* parent, const char* title, const char* link) {
+static TocItem* newDjVuTocItem(TocItem* parent, const char* title, const char* link) {
     AutoFreeWstr s = strconv::Utf8ToWstr(title);
-    auto res = new DocTocItem(parent, s, 0);
+    auto res = new TocItem(parent, s, 0);
     res->dest = newDjVuDestination(link);
     res->pageNo = res->dest->GetPageNo();
     return res;
 }
 
-class DjVuContext {
-    bool initialized;
-    ddjvu_context_t* ctx;
-
-  public:
+struct DjVuContext {
+    ddjvu_context_t* ctx = nullptr;
+    int refCount = 1;
     CRITICAL_SECTION lock;
 
-    DjVuContext() : ctx(nullptr), initialized(false) {
+    DjVuContext() {
+        InitializeCriticalSection(&lock);
+        ctx = ddjvu_context_create("DjVuEngine");
+        // reset the locale to "C" as most other code expects
+        setlocale(LC_ALL, "C");
+        CrashIf(!ctx);
     }
+
+    int AddRef() {
+        EnterCriticalSection(&lock);
+        ++refCount;
+        int res = refCount;
+        LeaveCriticalSection(&lock);
+        return res;
+    }
+
+    int Release() {
+        EnterCriticalSection(&lock);
+        CrashIf(refCount <= 0);
+        --refCount;
+        LeaveCriticalSection(&lock);
+        return refCount;
+    }
+
     ~DjVuContext() {
-        if (initialized) {
-            EnterCriticalSection(&lock);
-            if (ctx)
-                ddjvu_context_release(ctx);
-            LeaveCriticalSection(&lock);
-            DeleteCriticalSection(&lock);
+        EnterCriticalSection(&lock);
+        if (ctx) {
+            ddjvu_context_release(ctx);
         }
+        LeaveCriticalSection(&lock);
+        DeleteCriticalSection(&lock);
         minilisp_finish();
     }
 
-    bool Initialize() {
-        if (!initialized) {
-            initialized = true;
-            InitializeCriticalSection(&lock);
-            ctx = ddjvu_context_create("DjVuEngine");
-            // reset the locale to "C" as most other code expects
-            setlocale(LC_ALL, "C");
-        }
-
-        return ctx != nullptr;
-    }
-
     void SpinMessageLoop(bool wait = true) {
-        UNUSED(wait);
-        const ddjvu_message_t* msg;
-#if defined(THREADMODEL) && THREADMODEL != NOTHREADS
-        if (wait)
+        const ddjvu_message_t* msg = nullptr;
+        if (wait) {
             ddjvu_message_wait(ctx);
-#endif
+        }
         while ((msg = ddjvu_message_peek(ctx)) != nullptr) {
-            if (DDJVU_NEWSTREAM == msg->m_any.tag && msg->m_newstream.streamid != 0)
-                ddjvu_stream_close(msg->m_any.document, msg->m_newstream.streamid, /* stop */ FALSE);
+            auto tag = msg->m_any.tag;
+            if (DDJVU_NEWSTREAM == tag) {
+                auto streamId = msg->m_newstream.streamid;
+                if (streamId != 0) {
+                    BOOL stop = FALSE;
+                    ddjvu_stream_close(msg->m_any.document, streamId, stop);
+                }
+            }
             ddjvu_message_pop(ctx);
         }
     }
@@ -155,64 +192,67 @@ class DjVuContext {
     }
 };
 
-static DjVuContext gDjVuContext;
+// TODO: make it non-static because it accesses other static state
+// in djvu which got deleted first
+static DjVuContext* gDjVuContext;
+
+static DjVuContext* GetDjVuContext() {
+    if (!gDjVuContext) {
+        gDjVuContext = new DjVuContext();
+    } else {
+        gDjVuContext->AddRef();
+    }
+    return gDjVuContext;
+}
+
+static void ReleaseDjVuContext() {
+    CrashIf(!gDjVuContext);
+    int refCount = gDjVuContext->Release();
+    if (refCount != 0) {
+        return;
+    }
+}
+
+void CleanupDjVuEngine() {
+    if (!gDjVuContext) {
+        return;
+    }
+    CrashIf(gDjVuContext->refCount != 0);
+    delete gDjVuContext;
+    gDjVuContext = nullptr;
+}
 
 class DjVuEngineImpl : public EngineBase {
   public:
     DjVuEngineImpl();
     virtual ~DjVuEngineImpl();
-    EngineBase* Clone() override {
-        if (stream != nullptr) {
-            return CreateFromStream(stream);
-        }
-        if (FileName() != nullptr) {
-            return CreateFromFile(FileName());
-        }
-        return nullptr;
-    }
+    EngineBase* Clone() override;
 
-    RectD PageMediabox(int pageNo) override {
-        AssertCrash(1 <= pageNo && pageNo <= pageCount);
-        return mediaboxes[pageNo - 1];
-    }
+    RectD PageMediabox(int pageNo) override;
     RectD PageContentBox(int pageNo, RenderTarget target = RenderTarget::View) override;
 
-    RenderedBitmap* RenderBitmap(int pageNo, float zoom, int rotation,
-                                 RectD* pageRect = nullptr, /* if nullptr: defaults to the page's mediabox */
-                                 RenderTarget target = RenderTarget::View, AbortCookie** cookie_out = nullptr) override;
+    RenderedBitmap* RenderPage(RenderPageArgs&) override;
 
-    PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false) override;
+    PointD TransformPoint(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false);
     RectD Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse = false) override;
 
     std::string_view GetFileData() override;
     bool SaveFileAs(const char* copyFileName, bool includeUserAnnots = false) override;
     WCHAR* ExtractPageText(int pageNo, RectI** coordsOut = nullptr) override;
-    bool HasClipOptimizations(int pageNo) override {
-        UNUSED(pageNo);
-        return false;
-    }
+    bool HasClipOptimizations(int pageNo) override;
 
-    WCHAR* GetProperty(DocumentProperty prop) override {
-        UNUSED(prop);
-        return nullptr;
-    }
+    WCHAR* GetProperty(DocumentProperty prop) override;
 
-    bool SupportsAnnotation(bool forSaving = false) const override {
-        return !forSaving;
-    }
     void UpdateUserAnnotations(Vec<PageAnnotation>* list) override;
 
     // we currently don't load pages lazily, so there's nothing to do here
-    bool BenchLoadPage(int pageNo) override {
-        UNUSED(pageNo);
-        return true;
-    }
+    bool BenchLoadPage(int pageNo) override;
 
     Vec<PageElement*>* GetElements(int pageNo) override;
     PageElement* GetElementAtPos(int pageNo, PointD pt) override;
 
     PageDestination* GetNamedDest(const WCHAR* name) override;
-    DocTocTree* GetTocTree() override;
+    TocTree* GetToc() override;
 
     WCHAR* GetPageLabel(int pageNo) const override;
     int GetPageByLabel(const WCHAR* label) const override;
@@ -228,16 +268,16 @@ class DjVuEngineImpl : public EngineBase {
     ddjvu_document_t* doc = nullptr;
     miniexp_t outline = miniexp_nil;
     miniexp_t* annos = nullptr;
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
     Vec<PageAnnotation> userAnnots;
 
-    Vec<ddjvu_fileinfo_t> fileInfo;
+    Vec<ddjvu_fileinfo_t> fileInfos;
 
     RenderedBitmap* CreateRenderedBitmap(const char* bmpData, SizeI size, bool grayscale) const;
     void AddUserAnnots(RenderedBitmap* bmp, int pageNo, float zoom, int rotation, RectI screen);
     bool ExtractPageText(miniexp_t item, str::WStr& extracted, Vec<RectI>& coords);
     char* ResolveNamedDest(const char* name);
-    DocTocItem* BuildTocTree(DocTocItem* parent, miniexp_t entry, int& idCounter);
+    TocItem* BuildTocTree(TocItem* parent, miniexp_t entry, int& idCounter);
     bool Load(const WCHAR* fileName);
     bool Load(IStream* stream);
     bool FinishLoading();
@@ -249,10 +289,13 @@ DjVuEngineImpl::DjVuEngineImpl() {
     defaultFileExt = L".djvu";
     // DPI isn't constant for all pages and thus premultiplied
     fileDPI = 300.0f;
+    supportsAnnotations = true;
+    supportsAnnotationsForSaving = false;
+    GetDjVuContext();
 }
 
 DjVuEngineImpl::~DjVuEngineImpl() {
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
 
     delete tocTree;
     free(mediaboxes);
@@ -274,6 +317,38 @@ DjVuEngineImpl::~DjVuEngineImpl() {
     if (stream) {
         stream->Release();
     }
+    ReleaseDjVuContext();
+}
+
+EngineBase* DjVuEngineImpl::Clone() {
+    if (stream != nullptr) {
+        return CreateFromStream(stream);
+    }
+    if (FileName() != nullptr) {
+        return CreateFromFile(FileName());
+    }
+    return nullptr;
+}
+
+RectD DjVuEngineImpl::PageMediabox(int pageNo) {
+    CrashIf(pageNo < 1 || pageNo > pageCount);
+    return mediaboxes[pageNo - 1];
+}
+
+bool DjVuEngineImpl::HasClipOptimizations(int pageNo) {
+    UNUSED(pageNo);
+    return false;
+}
+
+WCHAR* DjVuEngineImpl::GetProperty(DocumentProperty prop) {
+    UNUSED(prop);
+    return nullptr;
+}
+
+// we currently don't load pages lazily, so there's nothing to do here
+bool DjVuEngineImpl::BenchLoadPage(int pageNo) {
+    UNUSED(pageNo);
+    return true;
 }
 
 // Most functions of the ddjvu API such as ddjvu_document_get_pageinfo
@@ -358,19 +433,13 @@ bool DjVuEngineImpl::LoadMediaboxes() {
 }
 
 bool DjVuEngineImpl::Load(const WCHAR* fileName) {
-    if (!gDjVuContext.Initialize()) {
-        return false;
-    }
     SetFileName(fileName);
-    doc = gDjVuContext.OpenFile(fileName);
+    doc = gDjVuContext->OpenFile(fileName);
     return FinishLoading();
 }
 
 bool DjVuEngineImpl::Load(IStream* stream) {
-    if (!gDjVuContext.Initialize()) {
-        return false;
-    }
-    doc = gDjVuContext.OpenStream(stream);
+    doc = gDjVuContext->OpenStream(stream);
     return FinishLoading();
 }
 
@@ -379,10 +448,10 @@ bool DjVuEngineImpl::FinishLoading() {
         return false;
     }
 
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
 
     while (!ddjvu_document_decoding_done(doc)) {
-        gDjVuContext.SpinMessageLoop();
+        gDjVuContext->SpinMessageLoop();
     }
 
     if (ddjvu_document_decoding_error(doc)) {
@@ -402,7 +471,7 @@ bool DjVuEngineImpl::FinishLoading() {
             ddjvu_status_t status;
             ddjvu_pageinfo_t info;
             while ((status = ddjvu_document_get_pageinfo(doc, i, &info)) < DDJVU_JOB_OK) {
-                gDjVuContext.SpinMessageLoop();
+                gDjVuContext->SpinMessageLoop();
             }
             if (DDJVU_JOB_OK == status) {
                 double dx = info.width * GetFileDPI() / info.dpi;
@@ -417,8 +486,9 @@ bool DjVuEngineImpl::FinishLoading() {
         annos[i] = miniexp_dummy;
     }
 
-    while ((outline = ddjvu_document_get_outline(doc)) == miniexp_dummy)
-        gDjVuContext.SpinMessageLoop();
+    while ((outline = ddjvu_document_get_outline(doc)) == miniexp_dummy) {
+        gDjVuContext->SpinMessageLoop();
+    }
     if (!miniexp_consp(outline) || miniexp_car(outline) != miniexp_symbol("bookmarks")) {
         ddjvu_miniexp_release(doc, outline);
         outline = miniexp_nil;
@@ -429,10 +499,10 @@ bool DjVuEngineImpl::FinishLoading() {
         ddjvu_status_t status;
         ddjvu_fileinfo_s info;
         while ((status = ddjvu_document_get_fileinfo(doc, i, &info)) < DDJVU_JOB_OK) {
-            gDjVuContext.SpinMessageLoop();
+            gDjVuContext->SpinMessageLoop();
         }
         if (DDJVU_JOB_OK == status && info.type == 'P' && info.pageno >= 0) {
-            fileInfo.Append(info);
+            fileInfos.Append(info);
             hasPageLabels = hasPageLabels || !str::Eq(info.title, info.id);
         }
     }
@@ -535,127 +605,154 @@ RenderedBitmap* DjVuEngineImpl::CreateRenderedBitmap(const char* bmpData, SizeI 
     return new RenderedBitmap(hbmp, size, hMap);
 }
 
-RenderedBitmap* DjVuEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation, RectD* pageRect, RenderTarget target,
-                                             AbortCookie** cookieOut) {
-    UNUSED(cookieOut);
-    UNUSED(target);
-
-    ScopedCritSec scope(&gDjVuContext.lock);
-
+RenderedBitmap* DjVuEngineImpl::RenderPage(RenderPageArgs& args) {
+    ScopedCritSec scope(&gDjVuContext->lock);
+    auto pageRect = args.pageRect;
+    auto zoom = args.zoom;
+    auto pageNo = args.pageNo;
+    auto rotation = args.rotation;
     RectD pageRc = pageRect ? *pageRect : PageMediabox(pageNo);
     RectI screen = Transform(pageRc, pageNo, zoom, rotation).Round();
     RectI full = Transform(PageMediabox(pageNo), pageNo, zoom, rotation).Round();
     screen = full.Intersect(screen);
 
     ddjvu_page_t* page = ddjvu_page_create_by_pageno(doc, pageNo - 1);
-    if (!page)
+    if (!page) {
         return nullptr;
+    }
     int rotation4 = (((-rotation / 90) % 4) + 4) % 4;
     ddjvu_page_set_rotation(page, (ddjvu_page_rotation_t)rotation4);
 
-    while (!ddjvu_page_decoding_done(page))
-        gDjVuContext.SpinMessageLoop();
-    if (ddjvu_page_decoding_error(page))
+    while (!ddjvu_page_decoding_done(page)) {
+        gDjVuContext->SpinMessageLoop();
+    }
+    if (ddjvu_page_decoding_error(page)) {
         return nullptr;
+    }
 
     bool isBitonal = DDJVU_PAGETYPE_BITONAL == ddjvu_page_get_type(page);
-    ddjvu_format_t* fmt = ddjvu_format_create(isBitonal ? DDJVU_FORMAT_GREY8 : DDJVU_FORMAT_BGR24, 0, nullptr);
-    ddjvu_format_set_row_order(fmt, /* top_to_bottom */ TRUE);
+    ddjvu_format_style_t style = isBitonal ? DDJVU_FORMAT_GREY8 : DDJVU_FORMAT_BGR24;
+    ddjvu_format_t* fmt = ddjvu_format_create(style, 0, nullptr);
+
+    defer {
+        ddjvu_format_release(fmt);
+        ddjvu_page_release(page);
+    };
+
+    int topToBottom = TRUE;
+    ddjvu_format_set_row_order(fmt, topToBottom);
     ddjvu_rect_t prect = {full.x, full.y, full.dx, full.dy};
     ddjvu_rect_t rrect = {screen.x, 2 * full.y - screen.y + full.dy - screen.dy, screen.dx, screen.dy};
 
     RenderedBitmap* bmp = nullptr;
-    int stride = ((screen.dx * (isBitonal ? 1 : 3) + 3) / 4) * 4;
-    AutoFree bmpData(AllocArray<char>(stride * (screen.dy + 5)));
-    if (bmpData) {
-#ifndef DEBUG
-        ddjvu_render_mode_t mode = isBitonal ? DDJVU_RENDER_MASKONLY : DDJVU_RENDER_COLOR;
-#else
-        // TODO: there seems to be a heap corruption in IW44Image.cpp
-        //       in debug builds when passing in DDJVU_RENDER_COLOR
-        ddjvu_render_mode_t mode = DDJVU_RENDER_MASKONLY;
-#endif
-        if (!ddjvu_page_render(page, mode, &prect, &rrect, fmt, stride, bmpData.Get())) {
-            // nothing was rendered, leave the page blank (same as WinDjView)
-            memset(bmpData, 0xFF, stride * screen.dy);
-            isBitonal = true;
-        }
-        bmp = CreateRenderedBitmap(bmpData, screen.Size(), isBitonal);
-        AddUserAnnots(bmp, pageNo, zoom, rotation, screen);
+    size_t bytesPerPixel = isBitonal ? 1 : 3;
+    size_t dx = (size_t)screen.dx;
+    size_t dy = (size_t)screen.dy;
+    size_t stride = ((dx * bytesPerPixel + 3) / 4) * 4;
+    size_t nBytes = stride * (dy + 5);
+    AutoFree bmpData = AllocArray<char>(nBytes);
+    if (!bmpData) {
+        return nullptr;
     }
 
-    ddjvu_format_release(fmt);
-    ddjvu_page_release(page);
+    ddjvu_render_mode_t mode = isBitonal ? DDJVU_RENDER_MASKONLY : DDJVU_RENDER_COLOR;
+    int ok = ddjvu_page_render(page, mode, &prect, &rrect, fmt, (unsigned long)stride, bmpData.Get());
+    if (!ok) {
+        // nothing was rendered, leave the page blank (same as WinDjView)
+        memset(bmpData, 0xFF, stride * dy);
+        isBitonal = true;
+    }
+    bmp = CreateRenderedBitmap(bmpData, screen.Size(), isBitonal);
+    AddUserAnnots(bmp, pageNo, zoom, rotation, screen);
 
     return bmp;
 }
 
 RectD DjVuEngineImpl::PageContentBox(int pageNo, RenderTarget target) {
     UNUSED(target);
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
 
     RectD pageRc = PageMediabox(pageNo);
     ddjvu_page_t* page = ddjvu_page_create_by_pageno(doc, pageNo - 1);
-    if (!page)
+    if (!page) {
         return pageRc;
+    }
     ddjvu_page_set_rotation(page, DDJVU_ROTATE_0);
 
-    while (!ddjvu_page_decoding_done(page))
-        gDjVuContext.SpinMessageLoop();
-    if (ddjvu_page_decoding_error(page))
+    while (!ddjvu_page_decoding_done(page)) {
+        gDjVuContext->SpinMessageLoop();
+    }
+    if (ddjvu_page_decoding_error(page)) {
         return pageRc;
+    }
 
     // render the page in 8-bit grayscale up to 250x250 px in size
     ddjvu_format_t* fmt = ddjvu_format_create(DDJVU_FORMAT_GREY8, 0, nullptr);
+
+    defer {
+        ddjvu_format_release(fmt);
+        ddjvu_page_release(page);
+    };
+
     ddjvu_format_set_row_order(fmt, /* top_to_bottom */ TRUE);
     double zoom = std::min(std::min(250.0 / pageRc.dx, 250.0 / pageRc.dy), 1.0);
     RectI full = RectD(0, 0, pageRc.dx * zoom, pageRc.dy * zoom).Round();
     ddjvu_rect_t prect = {full.x, full.y, full.dx, full.dy}, rrect = prect;
 
-    AutoFree bmpData(AllocArray<char>(full.dx * full.dy + 1));
-    if (bmpData && ddjvu_page_render(page, DDJVU_RENDER_MASKONLY, &prect, &rrect, fmt, full.dx, bmpData.Get())) {
-        // determine the content box by counting white pixels from the edges
-        RectD content(full.dx, -1, 0, 0);
-        for (int y = 0; y < full.dy; y++) {
-            int x;
-            for (x = 0; x < full.dx && bmpData[y * full.dx + x] == '\xFF'; x++)
-                ;
-            if (x < full.dx) {
-                // narrow the left margin down (if necessary)
-                if (x < content.x)
-                    content.x = x;
-                // narrow the right margin down (if necessary)
-                for (x = full.dx - 1; x > content.x + content.dx && bmpData[y * full.dx + x] == '\xFF'; x--)
-                    ;
-                if (x > content.x + content.dx)
-                    content.dx = x - content.x + 1;
-                // narrow either the top or the bottom margin down
-                if (content.y == -1)
-                    content.y = y;
-                else
-                    content.dy = y - content.y + 1;
-            }
-        }
-        if (!content.IsEmpty()) {
-            // undo the zoom and round generously
-            content.x /= zoom;
-            content.dx /= zoom;
-            content.y /= zoom;
-            content.dy /= zoom;
-            pageRc = content.Round().Convert<double>();
-        }
+    AutoFree bmpData = AllocArray<char>(full.dx * full.dy + 1);
+    if (!bmpData) {
+        return pageRc;
     }
 
-    ddjvu_format_release(fmt);
-    ddjvu_page_release(page);
+    int ok = ddjvu_page_render(page, DDJVU_RENDER_MASKONLY, &prect, &rrect, fmt, full.dx, bmpData.Get());
+    if (!ok) {
+        return pageRc;
+    }
+
+    // determine the content box by counting white pixels from the edges
+    RectD content(full.dx, -1, 0, 0);
+    for (int y = 0; y < full.dy; y++) {
+        int x;
+        for (x = 0; x < full.dx && bmpData[y * full.dx + x] == '\xFF'; x++) {
+            // no-op
+        }
+        if (x < full.dx) {
+            // narrow the left margin down (if necessary)
+            if (x < content.x) {
+                content.x = x;
+            }
+            // narrow the right margin down (if necessary)
+            for (x = full.dx - 1; x > content.x + content.dx && bmpData[y * full.dx + x] == '\xFF'; x--) {
+                // no-op
+            }
+            if (x > content.x + content.dx) {
+                content.dx = x - content.x + 1;
+            }
+            // narrow either the top or the bottom margin down
+            if (content.y == -1) {
+                content.y = y;
+            } else {
+                content.dy = y - content.y + 1;
+            }
+        }
+    }
+    if (!content.IsEmpty()) {
+        // undo the zoom and round generously
+        content.x /= zoom;
+        content.dx /= zoom;
+        content.y /= zoom;
+        content.dy /= zoom;
+        pageRc = content.Round().Convert<double>();
+    }
 
     return pageRc;
 }
 
-PointD DjVuEngineImpl::Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
-    AssertCrash(zoom > 0);
-    if (zoom <= 0)
+PointD DjVuEngineImpl::TransformPoint(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
+    CrashIf(zoom <= 0);
+    if (zoom <= 0) {
         return pt;
+    }
 
     SizeD page = PageMediabox(pageNo).Size();
 
@@ -663,34 +760,34 @@ PointD DjVuEngineImpl::Transform(PointD pt, int pageNo, float zoom, int rotation
         // transform the page size to get a correct frame of reference
         page.dx *= zoom;
         page.dy *= zoom;
-        if (rotation % 180 != 0)
+        if (rotation % 180 != 0) {
             std::swap(page.dx, page.dy);
+        }
         // invert rotation and zoom
         rotation = -rotation;
         zoom = 1.0f / zoom;
     }
 
-    PointD res;
     rotation = rotation % 360;
-    if (rotation < 0)
+    while (rotation < 0) {
         rotation += 360;
-    if (90 == rotation)
+    }
+    PointD res = pt; // for rotation == 0
+    if (90 == rotation) {
         res = PointD(page.dy - pt.y, pt.x);
-    else if (180 == rotation)
+    } else if (180 == rotation) {
         res = PointD(page.dx - pt.x, page.dy - pt.y);
-    else if (270 == rotation)
+    } else if (270 == rotation) {
         res = PointD(pt.y, page.dx - pt.x);
-    else // if (0 == rotation)
-        res = pt;
-
+    }
     res.x *= zoom;
     res.y *= zoom;
     return res;
 }
 
 RectD DjVuEngineImpl::Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse) {
-    PointD TL = Transform(rect.TL(), pageNo, zoom, rotation, inverse);
-    PointD BR = Transform(rect.BR(), pageNo, zoom, rotation, inverse);
+    PointD TL = TransformPoint(rect.TL(), pageNo, zoom, rotation, inverse);
+    PointD BR = TransformPoint(rect.BR(), pageNo, zoom, rotation, inverse);
     return RectD::FromXY(TL, BR);
 }
 
@@ -779,29 +876,34 @@ bool DjVuEngineImpl::ExtractPageText(miniexp_t item, str::WStr& extracted, Vec<R
 
 WCHAR* DjVuEngineImpl::ExtractPageText(int pageNo, RectI** coordsOut) {
     const WCHAR* lineSep = L"\n";
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
 
     miniexp_t pagetext;
-    while ((pagetext = ddjvu_document_get_pagetext(doc, pageNo - 1, nullptr)) == miniexp_dummy)
-        gDjVuContext.SpinMessageLoop();
-    if (miniexp_nil == pagetext)
+    while ((pagetext = ddjvu_document_get_pagetext(doc, pageNo - 1, nullptr)) == miniexp_dummy) {
+        gDjVuContext->SpinMessageLoop();
+    }
+    if (miniexp_nil == pagetext) {
         return nullptr;
+    }
 
     str::WStr extracted;
     Vec<RectI> coords;
     bool success = ExtractPageText(pagetext, extracted, coords);
     ddjvu_miniexp_release(doc, pagetext);
-    if (!success)
+    if (!success) {
         return nullptr;
-    if (extracted.size() > 0 && !str::EndsWith(extracted.Get(), lineSep))
+    }
+    if (extracted.size() > 0 && !str::EndsWith(extracted.Get(), lineSep)) {
         AppendNewline(extracted, coords, lineSep);
+    }
 
-    AssertCrash(str::Len(extracted.Get()) == coords.size());
+    CrashIf(str::Len(extracted.Get()) != coords.size());
     if (coordsOut) {
         ddjvu_status_t status;
         ddjvu_pageinfo_t info;
-        while ((status = ddjvu_document_get_pageinfo(doc, pageNo - 1, &info)) < DDJVU_JOB_OK)
-            gDjVuContext.SpinMessageLoop();
+        while ((status = ddjvu_document_get_pageinfo(doc, pageNo - 1, &info)) < DDJVU_JOB_OK) {
+            gDjVuContext->SpinMessageLoop();
+        }
         float dpiFactor = 1.0;
         if (DDJVU_JOB_OK == status)
             dpiFactor = GetFileDPI() / info.dpi;
@@ -829,7 +931,7 @@ WCHAR* DjVuEngineImpl::ExtractPageText(int pageNo, RectI** coordsOut) {
 }
 
 void DjVuEngineImpl::UpdateUserAnnotations(Vec<PageAnnotation>* list) {
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
     if (list) {
         userAnnots = *list;
     } else {
@@ -838,18 +940,18 @@ void DjVuEngineImpl::UpdateUserAnnotations(Vec<PageAnnotation>* list) {
 }
 
 Vec<PageElement*>* DjVuEngineImpl::GetElements(int pageNo) {
-    AssertCrash(1 <= pageNo && pageNo <= PageCount());
+    CrashIf(pageNo < 1 || pageNo > PageCount());
     if (annos && miniexp_dummy == annos[pageNo - 1]) {
-        ScopedCritSec scope(&gDjVuContext.lock);
+        ScopedCritSec scope(&gDjVuContext->lock);
         while ((annos[pageNo - 1] = ddjvu_document_get_pageanno(doc, pageNo - 1)) == miniexp_dummy) {
-            gDjVuContext.SpinMessageLoop();
+            gDjVuContext->SpinMessageLoop();
         }
     }
     if (!annos || !annos[pageNo - 1]) {
         return nullptr;
     }
 
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
 
     Vec<PageElement*>* els = new Vec<PageElement*>();
     RectI page = PageMediabox(pageNo).Round();
@@ -857,7 +959,7 @@ Vec<PageElement*>* DjVuEngineImpl::GetElements(int pageNo) {
     ddjvu_status_t status;
     ddjvu_pageinfo_t info;
     while ((status = ddjvu_document_get_pageinfo(doc, pageNo - 1, &info)) < DDJVU_JOB_OK) {
-        gDjVuContext.SpinMessageLoop();
+        gDjVuContext->SpinMessageLoop();
     }
     float dpiFactor = 1.0;
     if (DDJVU_JOB_OK == status) {
@@ -961,9 +1063,10 @@ char* DjVuEngineImpl::ResolveNamedDest(const char* name) {
     if (!str::StartsWith(name, "#")) {
         return nullptr;
     }
-    for (size_t i = 0; i < fileInfo.size(); i++) {
-        if (str::EqI(name + 1, fileInfo.at(i).id)) {
-            return str::Format("#%d", fileInfo.at(i).pageno + 1);
+    for (size_t i = 0; i < fileInfos.size(); i++) {
+        ddjvu_fileinfo_t& fi = fileInfos[i];
+        if (str::EqI(name + 1, fi.id)) {
+            return str::Format("#%d", fi.pageno + 1);
         }
     }
     return nullptr;
@@ -972,30 +1075,33 @@ char* DjVuEngineImpl::ResolveNamedDest(const char* name) {
 PageDestination* DjVuEngineImpl::GetNamedDest(const WCHAR* name) {
     AutoFree nameUtf8(strconv::WstrToUtf8(name));
     if (!str::StartsWith(nameUtf8.Get(), "#")) {
-        nameUtf8.TakeOwnership(str::Join("#", nameUtf8.Get()));
+        nameUtf8.TakeOwnershipOf(str::Join("#", nameUtf8.Get()));
     }
 
-    AutoFree link(ResolveNamedDest(nameUtf8.Get()));
+    AutoFree link = ResolveNamedDest(nameUtf8.Get());
     if (link) {
         return newDjVuDestination(link);
     }
     return nullptr;
 }
 
-DocTocItem* DjVuEngineImpl::BuildTocTree(DocTocItem* parent, miniexp_t entry, int& idCounter) {
-    DocTocItem* node = nullptr;
+TocItem* DjVuEngineImpl::BuildTocTree(TocItem* parent, miniexp_t entry, int& idCounter) {
+    TocItem* node = nullptr;
 
     for (miniexp_t rest = entry; miniexp_consp(rest); rest = miniexp_cdr(rest)) {
         miniexp_t item = miniexp_car(rest);
-        if (!miniexp_consp(item) || !miniexp_consp(miniexp_cdr(item)) || !miniexp_stringp(miniexp_car(item)) ||
-            !miniexp_stringp(miniexp_cadr(item)))
+        if (!miniexp_consp(item) || !miniexp_consp(miniexp_cdr(item))) {
             continue;
+        }
 
         const char* name = miniexp_to_str(miniexp_car(item));
         const char* link = miniexp_to_str(miniexp_cadr(item));
+        if (!name || !link) {
+            continue;
+        }
 
-        DocTocItem* tocItem = nullptr;
-        AutoFree linkNo(ResolveNamedDest(link));
+        TocItem* tocItem = nullptr;
+        AutoFree linkNo = ResolveNamedDest(link);
         if (!linkNo) {
             tocItem = newDjVuTocItem(parent, name, link);
         } else if (!str::IsEmpty(name) && !str::Eq(name, link + 1)) {
@@ -1020,7 +1126,7 @@ DocTocItem* DjVuEngineImpl::BuildTocTree(DocTocItem* parent, miniexp_t entry, in
     return node;
 }
 
-DocTocTree* DjVuEngineImpl::GetTocTree() {
+TocTree* DjVuEngineImpl::GetToc() {
     if (outline == miniexp_nil) {
         return nullptr;
     }
@@ -1028,19 +1134,19 @@ DocTocTree* DjVuEngineImpl::GetTocTree() {
     if (tocTree) {
         return tocTree;
     }
-    ScopedCritSec scope(&gDjVuContext.lock);
+    ScopedCritSec scope(&gDjVuContext->lock);
     int idCounter = 0;
-    DocTocItem* root = BuildTocTree(nullptr, outline, idCounter);
+    TocItem* root = BuildTocTree(nullptr, outline, idCounter);
     if (!root) {
         return nullptr;
     }
-    tocTree = new DocTocTree(root);
+    tocTree = new TocTree(root);
     return tocTree;
 }
 
 WCHAR* DjVuEngineImpl::GetPageLabel(int pageNo) const {
-    for (size_t i = 0; i < fileInfo.size(); i++) {
-        ddjvu_fileinfo_t& info = fileInfo.at(i);
+    for (size_t i = 0; i < fileInfos.size(); i++) {
+        ddjvu_fileinfo_t& info = fileInfos.at(i);
         if (pageNo - 1 == info.pageno && !str::Eq(info.title, info.id)) {
             return strconv::Utf8ToWstr(info.title);
         }
@@ -1050,8 +1156,8 @@ WCHAR* DjVuEngineImpl::GetPageLabel(int pageNo) const {
 
 int DjVuEngineImpl::GetPageByLabel(const WCHAR* label) const {
     AutoFree labelUtf8(strconv::WstrToUtf8(label));
-    for (size_t i = 0; i < fileInfo.size(); i++) {
-        ddjvu_fileinfo_t& info = fileInfo.at(i);
+    for (size_t i = 0; i < fileInfos.size(); i++) {
+        ddjvu_fileinfo_t& info = fileInfos.at(i);
         if (str::EqI(info.title, labelUtf8.Get()) && !str::Eq(info.title, info.id)) {
             return info.pageno + 1;
         }

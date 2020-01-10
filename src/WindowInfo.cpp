@@ -496,7 +496,7 @@ static bool MatchFuzzy(const WCHAR* s1, const WCHAR* s2, bool partially = false)
 
 // finds the first ToC entry that (partially) matches a given normalized name
 // (ignoring case and whitespace differences)
-PageDestination* LinkHandler::FindTocItem(DocTocItem* item, const WCHAR* name, bool partially) {
+PageDestination* LinkHandler::FindTocItem(TocItem* item, const WCHAR* name, bool partially) {
     for (; item; item = item->next) {
         AutoFreeWstr fuzTitle(NormalizeFuzzy(item->title));
         if (MatchFuzzy(fuzTitle, name, partially))
@@ -524,9 +524,9 @@ void LinkHandler::GotoNamedDest(const WCHAR* name) {
     if (dest) {
         ScrollTo(dest);
         delete dest;
-    } else if (ctrl->HasTocTree()) {
-        auto* docTree = ctrl->GetTocTree();
-        DocTocItem* root = docTree->root;
+    } else if (ctrl->HacToc()) {
+        auto* docTree = ctrl->GetToc();
+        TocItem* root = docTree->root;
         AutoFreeWstr fuzName(NormalizeFuzzy(name));
         dest = FindTocItem(root, fuzName);
         if (!dest)

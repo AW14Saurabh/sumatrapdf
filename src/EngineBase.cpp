@@ -5,6 +5,7 @@
 #include "utils/BaseUtil.h"
 #include "utils/ScopedWin.h"
 #include "utils/WinUtil.h"
+#include "utils/Log.h"
 
 #include "wingui/TreeModel.h"
 
@@ -33,6 +34,32 @@ SizeI RenderedBitmap::Size() const {
     return size;
 }
 
+PageAnnotation::PageAnnotation(PageAnnotType type, int pageNo, RectD rect, COLORREF color) {
+    this->type = type;
+    this->pageNo = pageNo;
+    this->rect = rect;
+    this->color = color;
+}
+
+bool PageAnnotation::operator==(const PageAnnotation& other) const {
+    if (&other == this) {
+        return true;
+    }
+    if (other.type != type) {
+        return false;
+    }
+    if (other.pageNo != pageNo) {
+        return false;
+    }
+    if (other.color != color) {
+        return false;
+    }
+    if (other.rect != rect) {
+        return false;
+    }
+    return true;
+}
+
 Kind kindPageElementDest = "dest";
 Kind kindPageElementImage = "image";
 Kind kindPageElementComment = "comment";
@@ -54,6 +81,29 @@ Kind kindDestinationGoToPageDialog = "goToPageDialog";
 Kind kindDestinationPrintDialog = "printDialog";
 Kind kindDestinationSaveAsDialog = "saveAsDialog";
 Kind kindDestinationZoomToDialog = "zoomToDialog";
+
+static Kind destKinds[] = {
+    kindDestinationNone,           kindDestinationScrollTo,       kindDestinationLaunchURL,
+    kindDestinationLaunchEmbedded, kindDestinationLaunchFile,     kindDestinationNextPage,
+    kindDestinationPrevPage,       kindDestinationFirstPage,      kindDestinationLastPage,
+    kindDestinationFindDialog,     kindDestinationFullScreen,     kindDestinationGoBack,
+    kindDestinationGoForward,      kindDestinationGoToPageDialog, kindDestinationPrintDialog,
+    kindDestinationSaveAsDialog,   kindDestinationZoomToDialog,
+};
+
+Kind resolveDestKind(char* s) {
+    if (str::IsEmpty(s)) {
+        return nullptr;
+    }
+    for (Kind kind : destKinds) {
+        if (str::Eq(s, kind)) {
+            return kind;
+        }
+    }
+    logf("resolveDestKind: unknown kind '%s'\n", s);
+    CrashIf(true);
+    return nullptr;
+}
 
 PageDestination::~PageDestination() {
     free(value);
@@ -156,33 +206,40 @@ PageElement* clonePageElement(PageElement* el) {
     return res;
 }
 
-DocTocItem::DocTocItem(DocTocItem* parent, const WCHAR* title, int pageNo) {
+Kind kindTocFzOutline = "tocFzOutline";
+Kind kindTocFzOutlineAttachment = "tocFzOutlineAttachment";
+Kind kindTocFzLink = "tocFzLink";
+Kind kindTocDjvu = "tocDjvu";
+
+TocItem::TocItem(TocItem* parent, const WCHAR* title, int pageNo) {
     this->title = str::Dup(title);
     this->pageNo = pageNo;
     this->parent = parent;
 }
 
-DocTocItem::~DocTocItem() {
+TocItem::~TocItem() {
     delete child;
     delete dest;
     while (next) {
-        DocTocItem* tmp = next->next;
+        TocItem* tmp = next->next;
         next->next = nullptr;
         delete next;
         next = tmp;
     }
     free(title);
+    free(rawVal1);
+    free(rawVal2);
 }
 
-void DocTocItem::AddSibling(DocTocItem* sibling) {
-    DocTocItem* item = this;
+void TocItem::AddSibling(TocItem* sibling) {
+    TocItem* item = this;
     while (item->next) {
         item = item->next;
     }
     item->next = sibling;
 }
 
-void DocTocItem::OpenSingleNode() {
+void TocItem::OpenSingleNode() {
     // only open (root level) ToC nodes if there's at most two
     if (next && next->next) {
         return;
@@ -200,17 +257,24 @@ void DocTocItem::OpenSingleNode() {
 }
 
 // returns the destination this ToC item points to or nullptr
-// (the result is owned by the DocTocItem and MUST NOT be deleted)
+// (the result is owned by the TocItem and MUST NOT be deleted)
 // TODO: rename to GetDestination()
-PageDestination* DocTocItem::GetPageDestination() {
+PageDestination* TocItem::GetPageDestination() {
     return dest;
 }
 
-DocTocItem* CloneDocTocItemRecur(DocTocItem* ti) {
+TocItem* CloneTocItemRecur(TocItem* ti, bool removeUnchecked) {
     if (ti == nullptr) {
         return nullptr;
     }
-    DocTocItem* res = new DocTocItem();
+    if (removeUnchecked && ti->isUnchecked) {
+        TocItem* next = ti->next;
+        while (next && next->isUnchecked) {
+            next = next->next;
+        }
+        return CloneTocItemRecur(next, removeUnchecked);
+    }
+    TocItem* res = new TocItem();
     res->parent = ti->parent;
     res->title = str::Dup(ti->title);
     res->isOpenDefault = ti->isOpenDefault;
@@ -221,28 +285,33 @@ DocTocItem* CloneDocTocItemRecur(DocTocItem* ti) {
     res->fontFlags = ti->fontFlags;
     res->color = ti->color;
     res->dest = clonePageDestination(ti->dest);
-    res->child = CloneDocTocItemRecur(ti->child);
-    res->next = CloneDocTocItemRecur(ti->next);
+    res->child = CloneTocItemRecur(ti->child, removeUnchecked);
+
+    TocItem* next = ti->next;
+    if (removeUnchecked) {
+        while (next && next->isUnchecked) {
+            next = next->next;
+        }
+    }
+    res->next = CloneTocItemRecur(next, removeUnchecked);
     return res;
 }
 
-DocTocTree* CloneDocTocTree(DocTocTree* tree) {
-    DocTocTree* res = new DocTocTree();
-    res->filePath = str::Dup(tree->filePath);
-    res->name = str::Dup(tree->name);
-    res->root = CloneDocTocItemRecur(tree->root);
+TocTree* CloneTocTree(TocTree* tree, bool removeUnchecked) {
+    TocTree* res = new TocTree();
+    res->root = CloneTocItemRecur(tree->root, removeUnchecked);
     return res;
 }
 
-WCHAR* DocTocItem::Text() {
+WCHAR* TocItem::Text() {
     return title;
 }
 
-TreeItem* DocTocItem::Parent() {
+TreeItem* TocItem::Parent() {
     return parent;
 }
 
-int DocTocItem::ChildCount() {
+int TocItem::ChildCount() {
     int n = 0;
     auto node = child;
     while (node) {
@@ -252,16 +321,16 @@ int DocTocItem::ChildCount() {
     return n;
 }
 
-TreeItem* DocTocItem::ChildAt(int n) {
+TreeItem* TocItem::ChildAt(int n) {
     auto node = child;
     while (n > 0) {
-        node = node->next;
         n--;
+        node = node->next;
     }
     return node;
 }
 
-bool DocTocItem::IsExpanded() {
+bool TocItem::IsExpanded() {
     // leaf items cannot be expanded
     if (child == nullptr) {
         return false;
@@ -273,19 +342,30 @@ bool DocTocItem::IsExpanded() {
     return isOpenDefault != isOpenToggled;
 }
 
-bool DocTocItem::IsChecked() {
+bool TocItem::IsChecked() {
     return !isUnchecked;
 }
 
-DocTocTree::DocTocTree(DocTocItem* root) {
+bool TocItem::PageNumbersMatch() const {
+    if (!dest || dest->pageNo == 0) {
+        return true;
+    }
+    if (pageNo != dest->pageNo) {
+        logf("pageNo: %d, dest->pageNo: %d\n", pageNo, dest->pageNo);
+        return false;
+    }
+    return true;
+}
+
+TocTree::TocTree(TocItem* root) {
     this->root = root;
 }
 
-DocTocTree::~DocTocTree() {
+TocTree::~TocTree() {
     delete root;
 }
 
-int DocTocTree::RootCount() {
+int TocTree::RootCount() {
     int n = 0;
     auto node = root;
     while (node) {
@@ -295,13 +375,23 @@ int DocTocTree::RootCount() {
     return n;
 }
 
-TreeItem* DocTocTree::RootAt(int n) {
+TreeItem* TocTree::RootAt(int n) {
     auto node = root;
     while (n > 0) {
-        node = node->next;
         n--;
+        node = node->next;
     }
     return node;
+}
+
+RenderPageArgs::RenderPageArgs(int pageNo, float zoom, int rotation, RectD* pageRect, RenderTarget target,
+                               AbortCookie** cookie_out) {
+    this->pageNo = pageNo;
+    this->zoom = zoom;
+    this->rotation = rotation;
+    this->pageRect = pageRect;
+    this->target = target;
+    this->cookie_out = cookie_out;
 }
 
 EngineBase::~EngineBase() {
@@ -345,12 +435,12 @@ PageDestination* EngineBase::GetNamedDest(const WCHAR* name) {
     return nullptr;
 }
 
-bool EngineBase::HasTocTree() {
-    DocTocTree* tree = GetTocTree();
+bool EngineBase::HacToc() {
+    TocTree* tree = GetToc();
     return tree != nullptr;
 }
 
-DocTocTree* EngineBase::GetTocTree() {
+TocTree* EngineBase::GetToc() {
     return nullptr;
 }
 
@@ -385,4 +475,9 @@ RenderedBitmap* EngineBase::GetImageForPageElement(PageElement*) {
 
 void EngineBase::SetFileName(const WCHAR* s) {
     fileName.SetCopy(s);
+}
+
+PointD EngineBase::Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
+    RectD rect = Transform(RectD(pt, SizeD()), pageNo, zoom, rotation, inverse);
+    return PointD(rect.x, rect.y);
 }

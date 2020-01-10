@@ -3,7 +3,7 @@
 
 struct SelectionOnPage;
 struct WatchedFile;
-struct Bookmarks;
+struct VbkmFile;
 
 /* Data related to a single document loaded into a tab/window */
 /* (none of these depend on WindowInfo, so that a TabInfo could
@@ -31,22 +31,19 @@ class TabInfo {
     // previous View settings, needed when unchecking the Fit Width/Page toolbar buttons
     float prevZoomVirtual = INVALID_ZOOM;
     DisplayMode prevDisplayMode = DM_AUTOMATIC;
-    Vec<Bookmarks*>* altBookmarks = nullptr;
+    Vec<VbkmFile*> altBookmarks;
 
     TabInfo(const WCHAR* filePath = nullptr);
     ~TabInfo();
 
-    DisplayModel* AsFixed() const {
-        return ctrl ? ctrl->AsFixed() : nullptr;
-    }
-    ChmModel* AsChm() const {
-        return ctrl ? ctrl->AsChm() : nullptr;
-    }
-    EbookController* AsEbook() const {
-        return ctrl ? ctrl->AsEbook() : nullptr;
-    }
-    // returns nullptr if !AsFixed()
+    DisplayModel* AsFixed() const;
+
+    // only if AsFixed()
+    EngineBase* TabInfo::GetEngine() const;
     Kind GetEngineType() const;
+
+    ChmModel* AsChm() const;
+    EbookController* AsEbook() const;
 
     const WCHAR* GetTabTitle() const;
 };

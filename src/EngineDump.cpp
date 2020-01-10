@@ -171,7 +171,7 @@ char* DestRectToStr(EngineBase* engine, PageDestination* dest) {
     return nullptr;
 }
 
-void DumpTocItem(EngineBase* engine, DocTocItem* item, int level, int& idCounter) {
+void DumpTocItem(EngineBase* engine, TocItem* item, int level, int& idCounter) {
     for (; item; item = item->next) {
         AutoFree title(Escape(item->title));
         for (int i = 0; i < level; i++)
@@ -207,17 +207,17 @@ void DumpTocItem(EngineBase* engine, DocTocItem* item, int level, int& idCounter
 }
 
 void DumpToc(EngineBase* engine) {
-    DocTocTree* tree = engine->GetTocTree();
+    TocTree* tree = engine->GetToc();
     if (!tree) {
         return;
     }
     auto* root = tree->root;
     if (root) {
-        Out("\t<TocTree%s>\n", engine->HasTocTree() ? "" : " Expected=\"no\"");
+        Out("\t<TocTree%s>\n", engine->HacToc() ? "" : " Expected=\"no\"");
         int idCounter = 0;
         DumpTocItem(engine, root, 2, idCounter);
         Out("\t</TocTree>\n");
-    } else if (engine->HasTocTree()) {
+    } else if (engine->HacToc()) {
         Out("\t<TocTree />\n");
     }
 }
@@ -301,7 +301,8 @@ void DumpThumbnail(EngineBase* engine) {
     float zoom = std::min(128 / (float)rect.dx, 128 / (float)rect.dy) - 0.001f;
     RectI thumb = RectD(0, 0, rect.dx * zoom, rect.dy * zoom).Round();
     rect = engine->Transform(thumb.Convert<double>(), 1, zoom, 0, true);
-    RenderedBitmap* bmp = engine->RenderBitmap(1, zoom, 0, &rect);
+    RenderPageArgs args(1, zoom, 0, &rect);
+    RenderedBitmap* bmp = engine->RenderPage(args);
     if (!bmp) {
         Out("\t<Thumbnail />\n");
         return;
@@ -384,7 +385,8 @@ bool RenderDocument(EngineBase* engine, const WCHAR* renderPath, float zoom = 1.
 
     bool success = true;
     for (int pageNo = 1; pageNo <= engine->PageCount(); pageNo++) {
-        RenderedBitmap* bmp = engine->RenderBitmap(pageNo, zoom, 0);
+        RenderPageArgs args(pageNo, zoom, 0);
+        RenderedBitmap* bmp = engine->RenderPage(args);
         success &= bmp != nullptr;
         if (!bmp && !silent)
             ErrOut("Error: Failed to render page %d for %s!", pageNo, engine->FileName());

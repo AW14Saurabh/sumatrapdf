@@ -195,11 +195,11 @@ workspace "SumatraPDF"
     kind "StaticLib"
     characterset ("MBCS")
     language "C++"
-    -- TODO: try /D USE_EXCEPTION_EMULATION to see if it reduces the size
-    -- and disables the exceptions warnings
-    defines { "NEED_JPEG_DECODER", "THREADMODEL=0", "DDJVUAPI=/**/",  "MINILISPAPI=/**/", "DO_CHANGELOCALE=0", "DEBUGLVL=0" }
-    defines { "DISABLE_MMX" } -- TODO: maybe only for asan
-    disablewarnings { "4100", "4189", "4244", "4267", "4302", "4311", "4312" }
+    defines { "NEED_JPEG_DECODER", "WINTHREADS=1", "DDJVUAPI=/**/", "MINILISPAPI=/**/", "DEBUGLVL=0" }
+    filter {"platforms:x32_asan"}
+      defines { "DISABLE_MMX" }
+    filter{}
+    disablewarnings { "4100", "4189", "4244", "4267", "4302", "4311", "4312", "4505"}
     disablewarnings { "4456", "4457", "4459", "4530", "4611", "4701", "4702", "4703", "4706" }
     includedirs { "ext/libjpeg-turbo" }
     libdjvu_files()
@@ -600,13 +600,12 @@ workspace "SumatraPDF"
     cppdialect "C++latest"
     entrypoint "WinMainCRTStartup"
     flags { "NoManifest" }
-    includedirs { "src", "src/wingui" }
+    includedirs { "src", "src/wingui", "mupdf/include" }
 
-    sumatrapdf_files()
     synctex_files()
     mui_files()
     uia_files()
-    sumatra_files()
+    sumatrapdf_files()
 
     filter "configurations:ReleaseAnalyze"
       -- TODO: somehow /analyze- is default which creates warning about
@@ -627,7 +626,7 @@ workspace "SumatraPDF"
     }
     links {
       "comctl32", "delayimp", "gdiplus", "msimg32", "shlwapi", "urlmon",
-      "version", "windowscodecs", "wininet"
+      "version", "windowscodecs", "wininet", "d2d1.lib"
     }
     filter "platforms:x32_asan"
       -- asan-i386.lib
@@ -636,7 +635,8 @@ workspace "SumatraPDF"
       -- linkoptions { "/WHOLEARCHIVE:asan-i386.lib"}
     filter {}
     -- this is to prevent dll hijacking
-    linkoptions { "/DELAYLOAD:gdiplus.dll /DELAYLOAD:msimg32.dll /DELAYLOAD:shlwapi.dll /DELAYLOAD:urlmon.dll /DELAYLOAD:version.dll /DELAYLOAD:wininet.dll"}
+    linkoptions { "/DELAYLOAD:gdiplus.dll /DELAYLOAD:msimg32.dll /DELAYLOAD:shlwapi.dll" }
+    linkoptions { "/DELAYLOAD:urlmon.dll /DELAYLOAD:version.dll /DELAYLOAD:wininet.dll /DELAYLOAD:d2d1.lib" }
 
 
   -- a dll version where most functionality is in libmupdf.dll
@@ -648,11 +648,10 @@ workspace "SumatraPDF"
     flags { "NoManifest" }
     includedirs { "src", "src/wingui", "mupdf/include" }
 
-    sumatrapdf_files()
     synctex_files()
     mui_files()
     uia_files()
-    sumatra_files()
+    sumatrapdf_files()
 
     filter "configurations:ReleaseAnalyze"
       -- TODO: somehow /analyze- is default which creates warning about
@@ -677,13 +676,16 @@ workspace "SumatraPDF"
     }
     links {
       "comctl32", "delayimp", "gdiplus", "msimg32", "shlwapi", "urlmon",
-      "version", "wininet"
+      "version", "wininet", "d2d1.lib"
     }
     -- this is to prevent dll hijacking
-    linkoptions { "/DELAYLOAD:libmupdf.dll /DELAYLOAD:gdiplus.dll /DELAYLOAD:msimg32.dll /DELAYLOAD:shlwapi.dll /DELAYLOAD:urlmon.dll /DELAYLOAD:version.dll /DELAYLOAD:wininet.dll"}
+    linkoptions { "/DELAYLOAD:libmupdf.dll" }
+    linkoptions { "/DELAYLOAD:gdiplus.dll /DELAYLOAD:msimg32.dll /DELAYLOAD:shlwapi.dll" }
+    linkoptions { "/DELAYLOAD:urlmon.dll /DELAYLOAD:version.dll /DELAYLOAD:wininet.dll /DELAYLOAD:d2d1.lib" }
     dependson { "PdfFilter", "PdfPreview" }
     prebuildcommands { "cd %{cfg.targetdir} & ..\\..\\bin\\MakeLZSA.exe InstallerData.dat libmupdf.dll:libmupdf.dll PdfFilter.dll:PdfFilter.dll PdfPreview.dll:PdfPreview.dll"  }
 
+  --[[
   project "TestApp"
     kind "WindowedApp"
     language "C++"
@@ -699,3 +701,4 @@ workspace "SumatraPDF"
     filter "platforms:x32_asan"
       links { "clang_rt.asan-i386.lib" }
     filter {}
+  --]]

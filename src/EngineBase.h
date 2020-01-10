@@ -2,7 +2,7 @@
    License: GPLv3 */
 
 extern Kind kindEnginePdf;
-extern Kind kindEnginePdfMulti;
+extern Kind kindEngineMulti;
 extern Kind kindEngineXps;
 extern Kind kindEngineDjVu;
 extern Kind kindEngineImage;
@@ -84,6 +84,8 @@ extern Kind kindDestinationPrintDialog;
 extern Kind kindDestinationSaveAsDialog;
 extern Kind kindDestinationZoomToDialog;
 
+Kind resolveDestKind(char* s);
+
 // a link destination
 class PageDestination {
   public:
@@ -119,13 +121,8 @@ struct PageAnnotation {
     COLORREF color = 0;
 
     PageAnnotation() = default;
-
-    PageAnnotation(PageAnnotType type, int pageNo, RectD rect, COLORREF color)
-        : type(type), pageNo(pageNo), rect(rect), color(color) {
-    }
-    bool operator==(const PageAnnotation& other) const {
-        return other.type == type && other.pageNo == pageNo && other.rect == rect && other.color == color;
-    }
+    PageAnnotation(PageAnnotType type, int pageNo, RectD rect, COLORREF color);
+    bool operator==(const PageAnnotation& other) const;
 };
 
 // use in PageDestination::GetDestRect for values that don't matter
@@ -165,14 +162,25 @@ class PageElement {
 PageElement* clonePageElement(PageElement*);
 
 // those are the same as F font bitmask in PDF docs
-// for DocTocItem::fontFlags
+// for TocItem::fontFlags
 constexpr int fontBitBold = 0;
 constexpr int fontBitItalic = 1;
 
+extern Kind kindTocFzOutline;
+extern Kind kindTocFzLink;
+extern Kind kindTocFzOutlineAttachment;
+extern Kind kindTocDjvu;
+
 // an item in a document's Table of Content
-class DocTocItem : public TreeItem {
-  public:
-    DocTocItem* parent = nullptr;
+struct TocItem : TreeItem {
+    // each engine has a raw representation of the toc item which
+    // we want to access. Not (yet) supported by all engines
+    // other values come from parsing this value
+    Kind kindRaw = nullptr;
+    char* rawVal1 = nullptr;
+    char* rawVal2 = nullptr;
+
+    TocItem* parent = nullptr;
 
     // the item's visible label
     WCHAR* title = nullptr;
@@ -191,11 +199,11 @@ class DocTocItem : public TreeItem {
 
     // auto-calculated page number that tells us a span from
     // pageNo => endPageNo
-    // only used by TocEditor and EnginePdfMulti
-    // TODO: maybe create a subclass of DocTocItem
+    // only used by TocEditor and EngineMulti
+    // TODO: maybe create a subclass of TocItem
     int endPageNo = 0;
 
-    // arbitrary number allowing to distinguish this DocTocItem
+    // arbitrary number allowing to distinguish this TocItem
     // from any other of the same ToC tree (must be constant
     // between runs so that it can be persisted in FileState::tocState)
     int id = 0;
@@ -206,17 +214,17 @@ class DocTocItem : public TreeItem {
     PageDestination* dest = nullptr;
 
     // first child item
-    DocTocItem* child = nullptr;
+    TocItem* child = nullptr;
     // next sibling
-    DocTocItem* next = nullptr;
+    TocItem* next = nullptr;
 
-    DocTocItem() = default;
+    TocItem() = default;
 
-    explicit DocTocItem(DocTocItem* parent, const WCHAR* title, int pageNo);
+    explicit TocItem(TocItem* parent, const WCHAR* title, int pageNo);
 
-    ~DocTocItem() override;
+    ~TocItem() override;
 
-    void AddSibling(DocTocItem* sibling);
+    void AddSibling(TocItem* sibling);
 
     void OpenSingleNode();
 
@@ -230,29 +238,25 @@ class DocTocItem : public TreeItem {
     TreeItem* ChildAt(int n) override;
     bool IsExpanded() override;
     bool IsChecked() override;
+
+    bool PageNumbersMatch() const;
 };
 
-DocTocItem* CloneDocTocItemRecur(DocTocItem*);
+TocItem* CloneTocItemRecur(TocItem*, bool);
 
-struct DocTocTree : public TreeModel {
-    // name of the bookmark view
-    AutoFree name;
+struct TocTree : TreeModel {
+    TocItem* root = nullptr;
 
-    // path of the file
-    AutoFree filePath;
-
-    DocTocItem* root = nullptr;
-
-    DocTocTree() = default;
-    DocTocTree(DocTocItem* root);
-    ~DocTocTree() override;
+    TocTree() = default;
+    TocTree(TocItem* root);
+    ~TocTree() override;
 
     // TreeModel
     int RootCount() override;
     TreeItem* RootAt(int n) override;
 };
 
-DocTocTree* CloneDocTocTree(DocTocTree*);
+TocTree* CloneTocTree(TocTree*, bool removeUnchecked);
 
 // a helper that allows for rendering interruptions in an engine-agnostic way
 class AbortCookie {
@@ -264,14 +268,17 @@ class AbortCookie {
     virtual void Abort() = 0;
 };
 
-// TODO: use this for RenderBitmap() call
-struct RenderBitmapArgs {
+struct RenderPageArgs {
     int pageNo = 0;
     float zoom = 0;
     int rotation = 0;
+    /* if nullptr: defaults to the page's mediabox */
     RectD* pageRect = nullptr;
     RenderTarget target = RenderTarget::View;
-    AbortCookie** cookie = nullptr;
+    AbortCookie** cookie_out = nullptr;
+
+    RenderPageArgs(int pageNo, float zoom, int rotation, RectD* pageRect = nullptr,
+                   RenderTarget target = RenderTarget::View, AbortCookie** cookie_out = nullptr);
 };
 
 class EngineBase {
@@ -285,6 +292,11 @@ class EngineBase {
     bool isImageCollection = false;
     bool allowsPrinting = true;
     bool allowsCopyingText = true;
+    // TODO: generalize from PageAnnotation to PageModification
+    // whether this engine supports adding user annotations of all available types
+    // (either for rendering or for saving)
+    bool supportsAnnotations = false;
+    bool supportsAnnotationsForSaving = false;
     bool isPasswordProtected = false;
     char* decryptionKey = nullptr;
     bool hasPageLabels = false;
@@ -305,14 +317,11 @@ class EngineBase {
 
     // renders a page into a cacheable RenderedBitmap
     // (*cookie_out must be deleted after the call returns)
-    virtual RenderedBitmap* RenderBitmap(int pageNo, float zoom, int rotation,
-                                         RectD* pageRect = nullptr, /* if nullptr: defaults to the page's mediabox */
-                                         RenderTarget target = RenderTarget::View,
-                                         AbortCookie** cookie_out = nullptr) = 0;
+    virtual RenderedBitmap* RenderPage(RenderPageArgs& args) = 0;
 
     // applies zoom and rotation to a point in user/page space converting
     // it into device/screen space - or in the inverse direction
-    virtual PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false) = 0;
+    PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false);
     virtual RectD Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse = false) = 0;
 
     // returns the binary data for the current file
@@ -342,10 +351,6 @@ class EngineBase {
     // access to various document properties (such as Author, Title, etc.)
     virtual WCHAR* GetProperty(DocumentProperty prop) = 0;
 
-    // TODO: generalize from PageAnnotation to PageModification
-    // whether this engine supports adding user annotations of all available types
-    // (either for rendering or for saving)
-    virtual bool SupportsAnnotation(bool forSaving = false) const = 0;
     // informs the engine about annotations the user made so that they can be rendered, etc.
     // (this call supercedes any prior call to UpdateUserAnnotations)
     virtual void UpdateUserAnnotations(Vec<PageAnnotation>* list) = 0;
@@ -373,11 +378,11 @@ class EngineBase {
     virtual PageDestination* GetNamedDest(const WCHAR* name);
 
     // checks whether this document has an associated Table of Contents
-    bool HasTocTree();
+    bool HacToc();
 
     // returns the root element for the loaded document's Table of Contents
     // caller must delete the result (when no longer needed)
-    virtual DocTocTree* GetTocTree();
+    virtual TocTree* GetToc();
 
     // checks whether this document has explicit labels for pages (such as
     // roman numerals) instead of the default plain arabic numbering

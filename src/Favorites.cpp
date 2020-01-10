@@ -407,7 +407,7 @@ void RebuildFavMenu(WindowInfo* win, HMENU menu) {
             win::menu::SetText(menu, IDM_FAV_DEL, s);
         } else {
             win::menu::SetEnabled(menu, IDM_FAV_DEL, false);
-            AutoFreeWstr s(str::Format(_TR("Add page %s to favorites"), label.Get()));
+            AutoFreeWstr s(str::Format(_TR("Add page %s to favorites\tCtrl+B"), label.Get()));
             win::menu::SetText(menu, IDM_FAV_ADD, s);
         }
         AppendFavMenus(menu, win->ctrl->FilePath());
@@ -581,8 +581,8 @@ void UpdateFavoritesTreeForAllWindows() {
     }
 }
 
-static DocTocItem* TocItemForPageNo(DocTocItem* item, int pageNo) {
-    DocTocItem* currItem = nullptr;
+static TocItem* TocItemForPageNo(TocItem* item, int pageNo) {
+    TocItem* currItem = nullptr;
 
     for (; item; item = item->next) {
         if (1 <= item->pageNo && item->pageNo <= pageNo) {
@@ -593,7 +593,7 @@ static DocTocItem* TocItemForPageNo(DocTocItem* item, int pageNo) {
         }
 
         // find any child item closer to the specified page
-        DocTocItem* subItem = TocItemForPageNo(item->child, pageNo);
+        TocItem* subItem = TocItemForPageNo(item->child, pageNo);
         if (subItem) {
             currItem = subItem;
         }
@@ -631,11 +631,11 @@ void AddFavoriteForCurrentPage(WindowInfo* win, int pageNo) {
     AutoFreeWstr name;
     auto tab = win->currentTab;
     auto* ctrl = tab->ctrl;
-    if (ctrl->HasTocTree()) {
+    if (ctrl->HacToc()) {
         // use the current ToC heading as default name
-        auto* docTree = ctrl->GetTocTree();
-        DocTocItem* root = docTree->root;
-        DocTocItem* item = TocItemForPageNo(root, pageNo);
+        auto* docTree = ctrl->GetToc();
+        TocItem* root = docTree->root;
+        TocItem* item = TocItemForPageNo(root, pageNo);
         if (item) {
             name.SetCopy(item->title);
         }
@@ -778,7 +778,7 @@ TreeItem* GetOrSelectTreeItemAtPos(ContextMenuArgs* args, POINT& pt) {
 }
 
 static void OnFavTreeContextMenu(ContextMenuArgs* args) {
-    args->procArgs->didHandle = true;
+    args->didHandle = true;
 
     TreeCtrl* treeCtrl = (TreeCtrl*)args->w;
     CrashIf(!IsTree(treeCtrl->kind));

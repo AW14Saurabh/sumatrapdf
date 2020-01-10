@@ -19,9 +19,9 @@ var (
 )
 
 var (
-	svnPreReleaseVer string
-	gitSha1          string
-	sumatraVersion   string
+	preReleaseVer  string
+	gitSha1        string
+	sumatraVersion string
 )
 
 func isNum(s string) bool {
@@ -55,10 +55,10 @@ func extractSumatraVersionMust() string {
 
 func detectVersions() {
 	ver := getGitLinearVersionMust()
-	svnPreReleaseVer = strconv.Itoa(ver)
+	preReleaseVer = strconv.Itoa(ver)
 	gitSha1 = getGitSha1Must()
 	sumatraVersion = extractSumatraVersionMust()
-	logf("svnPreReleaseVer: '%s'\n", svnPreReleaseVer)
+	logf("preReleaseVer: '%s'\n", preReleaseVer)
 	logf("gitSha1: '%s'\n", gitSha1)
 	logf("sumatraVersion: '%s'\n", sumatraVersion)
 }
@@ -120,7 +120,7 @@ func setBuildConfig(sha1, preRelVer string, isDaily bool) {
 	todayDate := time.Now().Format("2006-01-02")
 	s += fmt.Sprintf("#define BUILT_ON %s\n", todayDate)
 	if preRelVer != "" {
-		s += fmt.Sprintf("#define SVN_PRE_RELEASE_VER %s\n", preRelVer)
+		s += fmt.Sprintf("#define PRE_RELEASE_VER %s\n", preRelVer)
 	}
 	if isDaily {
 		s += "#define IS_DAILY_BUILD 1\n"
@@ -149,6 +149,17 @@ func addZipFileMust(w *zip.Writer, path string) {
 	// fw is just a io.Writer so we can't Close() it. It's not necessary as
 	// it's implicitly closed by the next Create(), CreateHeader()
 	// or Close() call on zip.Writer
+}
+
+func createExeZipWithGoMust(dir string) {
+	path := filepath.Join(dir, "SumatraPDF.zip")
+	f, err := os.Create(path)
+	fatalIfErr(err)
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	addZipFileMust(zw, filepath.Join(dir, "SumatraPDF.exe"))
+	err = zw.Close()
+	fatalIfErr(err)
 }
 
 func createExeZipWithPigz(dir string) {
@@ -185,8 +196,8 @@ func createExeZipWithPigz(dir string) {
 // createExeZipWithGoMust() is faster, createExeZipWithPigz() generates slightly
 // smaller files
 func createExeZipMust(dir string) {
-	//createExeZipWithGoMust(dir)
-	createExeZipWithPigz(dir)
+	createExeZipWithGoMust(dir)
+	//createExeZipWithPigz(dir)
 }
 
 func createPdbZipMust(dir string) {
@@ -220,6 +231,7 @@ func createManifestMust() {
 	var lines []string
 	files := []string{
 		"SumatraPDF.exe",
+		"SumatraPDF.zip",
 		"SumatraPDF-dll.exe",
 		"libmupdf.dll",
 		"PdfFilter.dll",
@@ -227,7 +239,7 @@ func createManifestMust() {
 		"SumatraPDF.pdb.zip",
 		"SumatraPDF.pdb.lzsa",
 	}
-	dirs := []string{filepath.Join("out", "rel32"), filepath.Join("out", "rel64")}
+	dirs := []string{rel32Dir, rel64Dir}
 	for _, dir := range dirs {
 		for _, file := range files {
 			path := filepath.Join(dir, file)
@@ -255,7 +267,7 @@ func buildPreRelease(isDaily bool) {
 	detectSigntoolPath()
 	msbuildPath := detectMsbuildPath()
 
-	s := fmt.Sprintf("buidling pre-release version %s", svnPreReleaseVer)
+	s := fmt.Sprintf("buidling pre-release version %s", preReleaseVer)
 	defer makePrintDuration(s)()
 	verifyGitCleanMust()
 	verifyOnMasterBranchMust()
@@ -266,7 +278,7 @@ func buildPreRelease(isDaily bool) {
 
 	clean()
 
-	setBuildConfig(gitSha1, svnPreReleaseVer, isDaily)
+	setBuildConfig(gitSha1, preReleaseVer, isDaily)
 	defer revertBuildConfig()
 
 	slnPath := filepath.Join("vs2019", "SumatraPDF.sln")
@@ -274,21 +286,23 @@ func buildPreRelease(isDaily bool) {
 	// we want to sign files inside the installer, so we have to
 	runExeLoggedMust(msbuildPath, slnPath, `/t:SumatraPDF;SumatraPDF-dll;PdfFilter;PdfPreview;test_util`, `/p:Configuration=Release;Platform=Win32`, `/m`)
 
-	dir := filepath.Join("out", "rel32")
-	runTestUtilMust(dir)
-	signFilesMust(dir)
+	runTestUtilMust(rel32Dir)
+	signFilesMust(rel32Dir)
 
 	runExeLoggedMust(msbuildPath, slnPath, "/t:SumatraPDF;SumatraPDF-dll;PdfFilter;PdfPreview;test_util", "/p:Configuration=Release;Platform=x64", "/m")
 
-	dir = filepath.Join("out", "rel64")
-	runTestUtilMust(dir)
-	signFilesMust(dir)
+	runTestUtilMust(rel64Dir)
+	signFilesMust(rel64Dir)
 
-	createPdbZipMust(filepath.Join("out", "rel32"))
-	createPdbZipMust(filepath.Join("out", "rel64"))
+	// TODO: use pigz for release
+	createExeZipWithGoMust(rel32Dir)
+	createExeZipWithGoMust(rel64Dir)
 
-	createPdbLzsaMust(filepath.Join("out", "rel32"))
-	createPdbLzsaMust(filepath.Join("out", "rel64"))
+	createPdbZipMust(rel32Dir)
+	createPdbZipMust(rel64Dir)
+
+	createPdbLzsaMust(rel32Dir)
+	createPdbLzsaMust(rel64Dir)
 
 	copyArtifacts()
 	createManifestMust()
@@ -301,6 +315,7 @@ const (
 var (
 	artifactFiles = []string{
 		"SumatraPDF.exe",
+		"SumatraPDF.zip",
 		"SumatraPDF-dll.exe",
 		"SumatraPDF.pdb.lzsa",
 		"SumatraPDF.pdb.zip",
@@ -336,5 +351,44 @@ func signFilesMust(dir string) {
 }
 
 func buildRelease() {
-	// TODO: implement me
+	// early exit if missing
+	detectSigntoolPath()
+	msbuildPath := detectMsbuildPath()
+
+	s := fmt.Sprintf("buidling release version %s", sumatraVersion)
+	defer makePrintDuration(s)()
+	verifyGitCleanMust()
+	verifyOnReleaseBranchMust()
+	verifyTranslationsMust()
+
+	//verifyReleaseNotInS3Must(sumatraVersion)
+	//verifyReleaseNotInSpaces(sumatraVersion)
+
+	setBuildConfig(gitSha1, preReleaseVer, false)
+	defer revertBuildConfig()
+
+	slnPath := filepath.Join("vs2019", "SumatraPDF.sln")
+
+	// we want to sign files inside the installer, so we have to
+	runExeLoggedMust(msbuildPath, slnPath, `/t:SumatraPDF;SumatraPDF-dll;PdfFilter;PdfPreview;test_util`, `/p:Configuration=Release;Platform=Win32`, `/m`)
+
+	runTestUtilMust(rel32Dir)
+	signFilesMust(rel32Dir)
+
+	runExeLoggedMust(msbuildPath, slnPath, "/t:SumatraPDF;SumatraPDF-dll;PdfFilter;PdfPreview;test_util", "/p:Configuration=Release;Platform=x64", "/m")
+
+	runTestUtilMust(rel64Dir)
+	signFilesMust(rel64Dir)
+
+	createExeZipWithGoMust(rel32Dir)
+	createExeZipWithGoMust(rel64Dir)
+
+	createPdbZipMust(rel32Dir)
+	createPdbZipMust(rel64Dir)
+
+	createPdbLzsaMust(rel32Dir)
+	createPdbLzsaMust(rel64Dir)
+
+	copyArtifacts()
+	createManifestMust()
 }

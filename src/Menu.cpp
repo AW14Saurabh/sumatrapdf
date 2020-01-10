@@ -22,6 +22,7 @@
 #include "AppColors.h"
 #include "ProgressUpdateUI.h"
 #include "Notifications.h"
+#include "SumatraConfig.h"
 #include "SumatraPDF.h"
 #include "WindowInfo.h"
 #include "TabInfo.h"
@@ -76,9 +77,10 @@ static MenuDef menuDefFile[] = {
     { _TRN("New &window\tCtrl+N"),          IDM_NEW_WINDOW,             MF_REQ_DISK_ACCESS },
     { _TRN("&Open...\tCtrl+O"),             IDM_OPEN ,                  MF_REQ_DISK_ACCESS },
     { _TRN("&Close\tCtrl+W"),               IDM_CLOSE,                  MF_REQ_DISK_ACCESS },
-    { _TRN("Show in &folder"),              IDM_SHOW_IN_FOLDER,         MF_REQ_DISK_ACCESS},
+    { _TRN("Show in &folder"),              IDM_SHOW_IN_FOLDER,         MF_REQ_DISK_ACCESS },
     { _TRN("&Save As...\tCtrl+S"),          IDM_SAVEAS,                 MF_REQ_DISK_ACCESS },
-//[ ACCESSKEY_ALTERNATIVE // only one of these two will be shown
+    { _TRN("Save Annotations"),             IDM_SAVE_ANNOTATIONS_SMX,   MF_REQ_DISK_ACCESS },
+ //[ ACCESSKEY_ALTERNATIVE // only one of these two will be shown
 #ifdef ENABLE_SAVE_SHORTCUT
     { _TRN("Save S&hortcut...\tCtrl+Shift+S"), IDM_SAVEAS_BOOKMARK,     MF_REQ_DISK_ACCESS | MF_NOT_FOR_CHM | MF_NOT_FOR_EBOOK_UI },
 //| ACCESSKEY_ALTERNATIVE
@@ -225,6 +227,7 @@ static MenuDef menuDefContext[] = {
     { _TRN("Show &Favorites"),              IDM_FAV_TOGGLE,             0                 },
     { _TRN("Show &Bookmarks\tF12"),         IDM_VIEW_BOOKMARKS,         0                 },
     { _TRN("Show &Toolbar\tF8"),            IDM_VIEW_SHOW_HIDE_TOOLBAR, MF_NOT_FOR_EBOOK_UI },
+    { _TRN("Save Annotations"),             IDM_SAVE_ANNOTATIONS_SMX,   MF_REQ_DISK_ACCESS },
     { SEP_ITEM,                             0,                          MF_PLUGIN_MODE_ONLY | MF_REQ_ALLOW_COPY },
     { _TRN("&Save As..."),                  IDM_SAVEAS,                 MF_PLUGIN_MODE_ONLY | MF_REQ_DISK_ACCESS },
     { _TRN("&Print..."),                    IDM_PRINT,                  MF_PLUGIN_MODE_ONLY | MF_REQ_PRINTER_ACCESS },
@@ -509,7 +512,7 @@ void MenuUpdateStateForWindow(WindowInfo* win) {
 
     MenuUpdatePrintItem(win, win->menu);
 
-    bool enabled = win->IsDocLoaded() && tab && tab->ctrl->HasTocTree();
+    bool enabled = win->IsDocLoaded() && tab && tab->ctrl->HacToc();
     win::menu::SetEnabled(win->menu, IDM_VIEW_BOOKMARKS, enabled);
 
     bool documentSpecific = win->IsDocLoaded();
@@ -541,8 +544,10 @@ void MenuUpdateStateForWindow(WindowInfo* win) {
         }
     }
 
-    if (tab && tab->AsFixed()) {
-        win::menu::SetEnabled(win->menu, IDM_FIND_FIRST, !tab->AsFixed()->GetEngine()->IsImageCollection());
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    if (engine) {
+        win::menu::SetEnabled(win->menu, IDM_FIND_FIRST, !engine->IsImageCollection());
     }
 
     if (win->IsDocLoaded() && !fileExists) {
@@ -558,8 +563,7 @@ void MenuUpdateStateForWindow(WindowInfo* win) {
     win::menu::SetChecked(win->menu, IDM_DEBUG_EBOOK_UI, gGlobalPrefs->ebookUI.useFixedPageUI);
     win::menu::SetChecked(win->menu, IDM_DEBUG_MUI, mui::IsDebugPaint());
     win::menu::SetEnabled(win->menu, IDM_DEBUG_ANNOTATION,
-                          tab && tab->selectionOnPage && win->showSelection && tab->AsFixed() &&
-                              tab->AsFixed()->GetEngine()->SupportsAnnotation());
+                          tab && tab->selectionOnPage && win->showSelection && engine && engine->supportsAnnotations);
 }
 
 void OnAboutContextMenu(WindowInfo* win, int x, int y) {
@@ -643,11 +647,26 @@ void OnWindowContextMenu(WindowInfo* win, int x, int y) {
         win::menu::SetEnabled(popup, IDM_COPY_SELECTION, false);
     }
     MenuUpdatePrintItem(win, popup, true);
-    win::menu::SetEnabled(popup, IDM_VIEW_BOOKMARKS, win->ctrl->HasTocTree());
+    win::menu::SetEnabled(popup, IDM_VIEW_BOOKMARKS, win->ctrl->HacToc());
     win::menu::SetChecked(popup, IDM_VIEW_BOOKMARKS, win->tocVisible);
 
     win::menu::SetEnabled(popup, IDM_FAV_TOGGLE, HasFavorites());
     win::menu::SetChecked(popup, IDM_FAV_TOGGLE, gGlobalPrefs->showFavorites);
+
+    bool supportsAnnotations = false;
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    if (engine) {
+        supportsAnnotations = engine->supportsAnnotations;
+    }
+    bool canDoAnnotations = gIsDebugBuild || gIsPreReleaseBuild || gIsDailyBuild;
+    if (!canDoAnnotations) {
+        supportsAnnotations = false;
+    }
+    if (!supportsAnnotations) {
+        win::menu::Remove(popup, IDM_SAVE_ANNOTATIONS_SMX);
+    } else {
+        win::menu::SetEnabled(popup, IDM_SAVE_ANNOTATIONS_SMX, dm->userAnnotsModified);
+    }
 
     int pageNo = dm->GetPageNoByPoint({x, y});
     const WCHAR* filePath = win->ctrl->FilePath();
@@ -665,7 +684,7 @@ void OnWindowContextMenu(WindowInfo* win, int x, int y) {
             win::menu::Remove(popup, IDM_FAV_DEL);
 
             // %s and not %d because re-using translation from RebuildFavMenu()
-            auto tr = _TR("Add page %s to favorites");
+            auto tr = _TR("Add page %s to favorites\tCtrl+B");
             AutoFreeWstr s = str::Format(tr, pageLabel.Get());
             win::menu::SetText(popup, IDM_FAV_ADD, s);
         }
@@ -696,6 +715,7 @@ void OnWindowContextMenu(WindowInfo* win, int x, int y) {
         case IDM_FAV_TOGGLE:
         case IDM_PROPERTIES:
         case IDM_VIEW_SHOW_HIDE_TOOLBAR:
+        case IDM_SAVE_ANNOTATIONS_SMX:
             SendMessage(win->hwndFrame, WM_COMMAND, cmd, 0);
             break;
 
@@ -788,6 +808,22 @@ static void RebuildFileMenu(TabInfo* tab, HMENU menu) {
     }
     if (!CanViewWithHtmlHelp(tab)) {
         win::menu::Remove(menu, IDM_VIEW_WITH_HTML_HELP);
+    }
+
+    bool supportsAnnotations = false;
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    EngineBase* engine = tab ? tab->GetEngine() : nullptr;
+    if (engine) {
+        supportsAnnotations = engine->supportsAnnotations;
+    }
+    bool canDoAnnotations = gIsDebugBuild || gIsPreReleaseBuild || gIsDailyBuild;
+    if (!canDoAnnotations) {
+        supportsAnnotations = false;
+    }
+    if (!supportsAnnotations) {
+        win::menu::Remove(menu, IDM_SAVE_ANNOTATIONS_SMX);
+    } else {
+        win::menu::SetEnabled(menu, IDM_SAVE_ANNOTATIONS_SMX, dm->userAnnotsModified);
     }
 }
 

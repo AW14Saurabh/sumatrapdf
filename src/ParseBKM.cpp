@@ -21,8 +21,15 @@ Creating and parsing of .bkm files that contain alternative bookmarks view
 for PDF files.
 */
 
-Bookmarks::~Bookmarks() {
+using sv::ParsedKV;
+
+VbkmForFile::~VbkmForFile() {
     delete toc;
+    delete engine;
+}
+
+VbkmFile::~VbkmFile() {
+    DeleteVecMembers(vbkms);
 }
 
 static void SerializeKeyVal(char* key, WCHAR* val, str::Str& s) {
@@ -32,7 +39,7 @@ static void SerializeKeyVal(char* key, WCHAR* val, str::Str& s) {
     }
     s.AppendFmt(" %s:", key);
     AutoFree str = strconv::WstrToUtf8(val);
-    sv::AppendQuotedString(str.as_view(), s);
+    sv::AppendMaybeQuoted(str.as_view(), s);
 }
 
 static void SerializeDest(PageDestination* dest, str::Str& s) {
@@ -42,36 +49,47 @@ static void SerializeDest(PageDestination* dest, str::Str& s) {
     s.AppendFmt(" destkind:%s", dest->kind);
     SerializeKeyVal("destname", dest->GetName(), s);
     SerializeKeyVal("destvalue", dest->GetValue(), s);
-    if (dest->pageNo > 0) {
-        s.AppendFmt(" destpage:%d", dest->pageNo);
-    }
+    // Note: not serializing dest->pageno because it's redundant with
+    // TocItem::pageNo
     RectD r = dest->rect;
-    if (!r.empty()) {
-        s.AppendFmt(" destrect:%f,%f,%f,%f", r.x, r.y, r.dx, r.dy);
+    if (r.empty()) {
+        return;
     }
+    // TODO: using %g is not great, because it's scientific notian 1e6
+    // but this should not happen often.
+    // Unlike %f it doesn't serialize trailing zeros
+    if (r.dx == DEST_USE_DEFAULT || r.dy == DEST_USE_DEFAULT) {
+        s.AppendFmt(" pos:%g,%g", r.x, r.y);
+        return;
+    }
+    s.AppendFmt(" rect:%g,%g,%g,%g", r.x, r.y, r.dx, r.dy);
 }
 
-static void SerializeBookmarksRec(DocTocItem* node, int level, str::Str& s) {
-    if (level == 0) {
-        s.Append("title: default view\n");
-    }
-
+static void SerializeBookmarksRec(TocItem* node, int level, str::Str& s) {
     while (node) {
         for (int i = 0; i < level; i++) {
             s.Append("  ");
         }
         WCHAR* title = node->Text();
         AutoFree titleA = strconv::WstrToUtf8(title);
-        sv::AppendQuotedString(titleA.as_view(), s);
+        sv::AppendMaybeQuoted(titleA.as_view(), s);
         auto flags = node->fontFlags;
+        str::Str fontVal;
         if (bit::IsSet(flags, fontBitItalic)) {
-            s.Append(" font:italic");
+            fontVal.Append("italic");
         }
         if (bit::IsSet(flags, fontBitBold)) {
-            s.Append(" font:bold");
+            if (fontVal.size() > 0) {
+                fontVal.Append(",");
+            }
+            fontVal.Append("bold");
+        }
+        if (fontVal.size() > 0) {
+            s.Append(" font:");
+            s.AppendView(fontVal.as_view());
         }
         if (node->color != ColorUnset) {
-            s.Append(" ");
+            s.Append(" color:");
             SerializeColor(node->color, s);
         }
         if (node->pageNo != 0) {
@@ -84,17 +102,11 @@ static void SerializeBookmarksRec(DocTocItem* node, int level, str::Str& s) {
             s.AppendFmt(" open-toggled");
         }
         if (node->isUnchecked) {
-            s.AppendFmt("  unchecked");
+            s.AppendFmt(" unchecked");
         }
-        PageDestination* dest = node->GetPageDestination();
-        if (dest) {
-            int pageNo = dest->GetPageNo();
-            if (pageNo != node->pageNo) {
-                logf("pageNo: %d, node->pageNo: %d\n", pageNo, node->pageNo);
-            }
-            CrashIf(node->pageNo != pageNo);
-            SerializeDest(dest, s);
-        }
+
+        CrashIf(!node->PageNumbersMatch());
+        SerializeDest(node->GetPageDestination(), s);
         s.Append("\n");
 
         SerializeBookmarksRec(node->child, level + 1, s);
@@ -102,140 +114,8 @@ static void SerializeBookmarksRec(DocTocItem* node, int level, str::Str& s) {
     }
 }
 
-// parses "quoted string"
-static str::Str parseLineTitle(std::string_view& sv) {
-    str::Str res;
-    size_t n = sv.size();
-    // must be at least: ""
-    if (n < 2) {
-        return res;
-    }
-    const char* s = sv.data();
-    const char* e = s + n;
-    if (s[0] != '"') {
-        return res;
-    }
-    s++;
-    while (s < e) {
-        char c = *s;
-        if (c == '"') {
-            // the end
-            sv::SkipTo(sv, s + 1);
-            return res;
-        }
-        if (c != '\\') {
-            res.AppendChar(c);
-            s++;
-            continue;
-        }
-        // potentially un-escape
-        s++;
-        if (s >= e) {
-            break;
-        }
-        char c2 = *s;
-        bool unEscape = (c2 == '\\') || (c2 == '"');
-        if (!unEscape) {
-            res.AppendChar(c);
-            continue;
-        }
-        res.AppendChar(c2);
-        s++;
-    }
-
-    return res;
-}
-
-static std::tuple<COLORREF, bool> parseColor(std::string_view sv) {
-    COLORREF c = 0;
-    bool ok = ParseColor(&c, sv);
-    return {c, ok};
-}
-
-#if 0
-static void SerializeDest(PageDestination* dest, str::Str& s) {
-    if (!dest) {
-        return;
-    }
-    s.AppendFmt(" destkind:%s", dest->kind);
-    SerializeKeyVal("destname", dest->GetName(), s);
-    SerializeKeyVal("destvalue", dest->GetValue(), s);
-    if (dest->pageNo > 0) {
-        s.AppendFmt(" destpage:%d", dest->pageNo);
-    }
-    RectD r = dest->rect;
-    if (!r.empty()) {
-        s.AppendFmt(" destrect:%f,%f,%f,%f", r.x, r.y, r.dx, r.dy);
-    }
-}
-#endif
-
-struct ParsedDest {
-    int pageNo;
-};
-
-std::tuple<ParsedDest*, bool> parseDestination(std::string_view& sv) {
-    if (!str::StartsWith(sv, "page:")) {
-        return {nullptr, false};
-    }
-    // TODO: actually parse the info
-    auto* res = new ParsedDest{1};
-    return {res, true};
-}
-
-struct parsedKV {
-    char* key = nullptr;
-    char* val = nullptr;
-    bool ok = false;
-
-    parsedKV() = default;
-    ~parsedKV();
-};
-
-parsedKV::~parsedKV() {
-    free(key);
-    free(val);
-}
-
-// line could be:
-// "key"
-// "key:unquoted-value"
-// "key:"quoted value"
-// updates str in place to account for parsed data
-parsedKV parseKV(std::string_view& line) {
-    // eat white space
-    sv::SkipChars(line, ' ');
-
-    // find end of key (':', ' ' or end of text)
-    const char* s = line.data();
-    const char* end = s + line.length();
-
-    char c;
-    const char* key = s;
-    const char* keyEnd = nullptr;
-    str::Str val;
-    while (s < end) {
-        c = *s;
-        if (c == ':' || c == ' ') {
-            keyEnd = s - 1;
-            break;
-        }
-        s++;
-    }
-    if (keyEnd == nullptr) {
-        keyEnd = s;
-    } else {
-        if (*s == ':') {
-            s++;
-        }
-    }
-    parsedKV res;
-    return res;
-}
-
-// a single line in .bmk file is:
 // indentation "quoted title" additional-metadata* destination
-static DocTocItem* parseBookmarksLine(std::string_view line, size_t* indentOut) {
+static TocItem* parseTocLine(std::string_view line, size_t* indentOut) {
     auto origLine = line; // save for debugging
 
     // lines might start with an indentation, 2 spaces for one level
@@ -246,90 +126,154 @@ static DocTocItem* parseBookmarksLine(std::string_view line, size_t* indentOut) 
         return nullptr;
     }
     *indentOut = indent / 2;
-    sv::SkipChars(line, ' ');
-    // TODO: no way to indicate an error
-    str::Str title = parseLineTitle(line);
-    DocTocItem* res = new DocTocItem();
-    res->title = strconv::Utf8ToWstr(title.AsView());
+
+    // first item on the line is a title
+    str::Str title;
+    bool ok = sv::ParseMaybeQuoted(line, title, false);
+    TocItem* res = new TocItem();
+    res->title = strconv::Utf8ToWstr(title.as_view());
     PageDestination* dest = nullptr;
 
     // parse meta-data and page destination
-    std::string_view part;
     while (line.size() > 0) {
-        part = sv::ParseUntil(line, ' ');
-
-        if (str::Eq(part, "font:bold")) {
-            bit::Set(res->fontFlags, fontBitBold);
-            continue;
+        ParsedKV kv = sv::ParseKV(line, false);
+        if (!kv.ok) {
+            return nullptr;
+        }
+        char* key = kv.key;
+        char* val = kv.val;
+        CrashIf(!key);
+        if (str::EqI(key, "font")) {
+            if (!val) {
+                logf("parseBookmarksLine: got 'font' without value in line '%s'\n", origLine.data());
+                return nullptr;
+            }
+            if (str::EqI(val, "bold")) {
+                bit::Set(res->fontFlags, fontBitBold);
+                continue;
+            }
+            if (str::EqI(val, "italic")) {
+                bit::Set(res->fontFlags, fontBitItalic);
+                continue;
+            }
         }
 
-        if (str::Eq(part, "font:italic")) {
-            bit::Set(res->fontFlags, fontBitItalic);
-            continue;
-        }
-
-        auto [color, ok] = parseColor(part);
-        if (ok) {
-            res->color = color;
-            continue;
-        }
-
-        if (str::EqI(part, "open-default")) {
+        // TODO: fail if those have values
+        if (str::EqI(key, "open-default")) {
             res->isOpenDefault = true;
             continue;
         }
-        if (str::EqI(part, "open-toggled")) {
+
+        if (str::EqI(key, "open-toggled")) {
             res->isOpenToggled = true;
             continue;
         }
-        if (str::Eq(part, "unchecked")) {
+
+        if (str::Eq(key, "unchecked")) {
             res->isUnchecked = true;
             continue;
         }
+
+        if (str::Eq(key, "page")) {
+            if (!val) {
+                return nullptr;
+            }
+            str::Parse(val, "%d", &res->pageNo);
+            continue;
+        }
+
+        if (str::Eq(key, "color")) {
+            COLORREF c = 0;
+            ok = ParseColor(&c, val);
+            if (ok) {
+                res->color = c;
+            }
+            continue;
+        }
+
+        // the values here are for destination
+        if (!dest) {
+            dest = new PageDestination();
+            dest->value = str::Dup(res->title);
+        }
+
+        if (str::Eq(key, "destkind")) {
+            dest->kind = resolveDestKind(val);
+            continue;
+        }
+
+        if (str::Eq(key, "destname")) {
+            dest->name = strconv::Utf8ToWstr(val);
+            continue;
+        }
+
+        if (str::Eq(key, "destval")) {
+            dest->value = strconv::Utf8ToWstr(val);
+            continue;
+        }
+
+        if (str::Eq(key, "rect")) {
+            float x, y, dx, dy;
+            str::Parse(val, "%g,%g,%g,%g", &x, &y, &dx, &dy);
+            dest->rect = RectD(x, y, dx, dy);
+            continue;
+        }
+
+        if (str::Eq(key, "pos")) {
+            float x, y;
+            str::Parse(val, "%g,%g", &x, &y);
+            dest->rect = RectD(x, y, DEST_USE_DEFAULT, DEST_USE_DEFAULT);
+            continue;
+        }
+    }
+    if (dest) {
+        dest->pageNo = res->pageNo;
     }
     return res;
 }
 
-struct DocTocItemWithIndent {
-    DocTocItem* item = nullptr;
+struct TocItemWithIndent {
+    TocItem* item = nullptr;
     size_t indent = 0;
 
-    DocTocItemWithIndent() = default;
-    DocTocItemWithIndent(DocTocItem* item, size_t indent);
-    ~DocTocItemWithIndent() = default;
+    TocItemWithIndent() = default;
+    TocItemWithIndent(TocItem* item, size_t indent);
+    ~TocItemWithIndent() = default;
 };
 
-DocTocItemWithIndent::DocTocItemWithIndent(DocTocItem* item, size_t indent) {
+TocItemWithIndent::TocItemWithIndent(TocItem* item, size_t indent) {
     this->item = item;
     this->indent = indent;
 }
 
-// TODO: read more than one
-static bool parseBookmarks(std::string_view sv, Vec<Bookmarks*>* bkms) {
-    Vec<DocTocItemWithIndent> items;
+static bool parseVbkmSection(std::string_view sv, Vec<VbkmForFile*>& bkmsOut) {
+    Vec<TocItemWithIndent> items;
+
+    auto* bkm = new VbkmForFile();
 
     // first line should be "file: $file"
-    auto line = sv::ParseUntil(sv, '\n');
-    auto file = sv::ParseKV(line, "file");
-    if (file.empty()) {
+    auto file = sv::ParseValueOfKey(sv, "file", true);
+    if (!file.ok) {
         return false;
     }
 
+#if 0
     // this line should be "title: $title"
-    line = sv::ParseUntil(sv, '\n');
-    auto title = sv::ParseKV(line, "title");
-    if (title.empty()) {
+    auto title = sv::ParseValueOfKey(sv, "title", true);
+    if (!title.ok) {
         return false;
     }
-    auto tree = new DocTocTree();
-    tree->name = str::Dup(title);
+#endif
+    auto tree = new TocTree();
+    // tree->name = str::Dup(title.val);
     size_t indent = 0;
+    std::string_view line;
     while (true) {
         line = sv::ParseUntil(sv, '\n');
         if (line.empty()) {
             break;
         }
-        auto* item = parseBookmarksLine(line, &indent);
+        auto* item = parseTocLine(line, &indent);
         if (item == nullptr) {
             for (auto& el : items) {
                 delete el.item;
@@ -337,7 +281,7 @@ static bool parseBookmarks(std::string_view sv, Vec<Bookmarks*>* bkms) {
             delete tree;
             return false;
         }
-        DocTocItemWithIndent iwl = {item, indent};
+        TocItemWithIndent iwl = {item, indent};
         items.Append(iwl);
     }
     size_t nItems = items.size();
@@ -385,46 +329,123 @@ static bool parseBookmarks(std::string_view sv, Vec<Bookmarks*>* bkms) {
         }
     }
 
-    auto* bkm = new Bookmarks();
+    bkm->filePath = file.val;
+    file.val = nullptr; // take ownership
+
     bkm->toc = tree;
-    bkms->Append(bkm);
+    bkmsOut.Append(bkm);
 
     return true;
 }
 
-bool ParseBookmarksFile(std::string_view path, Vec<Bookmarks*>* bkms) {
-    AutoFree d = file::ReadFile(path);
-    if (!d.data) {
-        return false;
-    }
-    return parseBookmarks(d.as_view(), bkms);
-}
-
-Vec<Bookmarks*>* LoadAlterenativeBookmarks(std::string_view baseFileName) {
+// TODO: read more than one VbkmFile by trying multiple .1.bkm, .2.bkm etc.
+bool LoadAlterenativeBookmarks(std::string_view baseFileName, VbkmFile& vbkm) {
     str::Str path = baseFileName;
     path.Append(".bkm");
 
-    auto* res = new Vec<Bookmarks*>();
+    AutoFree d = file::ReadFile(path.as_view());
+    if (d.empty()) {
+        return false;
+    }
+    std::string_view sv = d.as_view();
+    AutoFree dataNormalized = sv::NormalizeNewlines(sv);
 
-    auto ok = ParseBookmarksFile(path.AsView(), res);
-    if (!ok) {
-        DeleteVecMembers(*res);
-        delete res;
-        return nullptr;
+    std::string_view svd = dataNormalized.as_view();
+
+    // first line could be name
+    auto name = sv::ParseValueOfKey(svd, "name", true);
+    if (name.ok) {
+        vbkm.name = name.val;
+        name.val = nullptr;
     }
 
-    // TODO: read more than one
+    bool ok = parseVbkmSection(svd, vbkm.vbkms);
+    return ok;
+}
+
+bool ExportBookmarksToFile(const Vec<VbkmForFile*>& bookmarks, const char* name, const char* bkmPath) {
+    str::Str s;
+    if (str::IsEmpty(name)) {
+        name = "default view";
+    }
+    s.AppendFmt("name: %s\n", name);
+    for (auto&& vbkm : bookmarks) {
+        const char* path = vbkm->filePath;
+        CrashIf(!path);
+        s.AppendFmt("file: %s\n", path);
+        TocTree* tocTree = vbkm->toc;
+        SerializeBookmarksRec(tocTree->root, 0, s);
+    }
+    return file::WriteFile(bkmPath, s.as_view());
+}
+
+// each logical record starts with "file:" line
+// we split s into list of records for each file
+// TODO: should we fail if the first line is not "file:" ?
+// Currently we ignore everything from the beginning
+// until first "file:" line
+static Vec<std::string_view> SplitVbkmIntoSectons(std::string_view s) {
+    Vec<std::string_view> res;
+    auto tmp = s;
+    Vec<const char*> addrs;
+
+    // find indexes of lines that start with "file:"
+    while (!tmp.empty()) {
+        auto line = sv::ParseUntil(tmp, '\n');
+        if (sv::StartsWith(line, "file:")) {
+            addrs.push_back(line.data());
+        }
+    }
+
+    size_t n = addrs.size();
+    if (n == 0) {
+        return res;
+    }
+    addrs.push_back(s.data() + s.size());
+    for (size_t i = 0; i < n; i++) {
+        const char* start = addrs[i];
+        const char* end = addrs[i + 1];
+        size_t size = end - start;
+        auto sv = std::string_view{start, size};
+        res.push_back(sv);
+    }
     return res;
 }
 
-bool ExportBookmarksToFile(const Vec<Bookmarks*>& bookmarks, const char* bkmPath) {
-    str::Str s;
-    for (auto&& bkm : bookmarks) {
-        DocTocTree* tocTree = bkm->toc;
-        const char* path = tocTree->filePath;
-        s.AppendFmt("file: %s\n", path);
-        SerializeBookmarksRec(tocTree->root, 0, s);
-        // dbglogf("%s\n", s.Get());
+bool ParseVbkmFile(std::string_view d, VbkmFile& vbkm) {
+    AutoFree s = sv::NormalizeNewlines(d);
+
+    std::string_view sv = s;
+
+    ParsedKV name = sv::ParseValueOfKey(sv, "name", true);
+    if (!name.ok) {
+        return false;
     }
-    return file::WriteFile(bkmPath, s.as_view());
+    vbkm.name = name.val;
+    name.val = nullptr;
+
+    auto records = SplitVbkmIntoSectons(sv);
+    auto n = records.size();
+    if (n == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        std::string_view rd = records[i];
+        bool ok = parseVbkmSection(rd, vbkm.vbkms);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LoadVbkmFile(const char* filePath, VbkmFile& vbkm) {
+    std::string_view sv = file::ReadFile(filePath);
+    if (sv.empty()) {
+        return false;
+    }
+    AutoFree svFree = sv;
+    bool ok = ParseVbkmFile(sv, vbkm);
+    return ok;
 }

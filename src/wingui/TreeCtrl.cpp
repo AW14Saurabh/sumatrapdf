@@ -105,6 +105,16 @@ static void SetTreeItemState(UINT uState, TreeItemState& state) {
     state.isChecked = n != 0;
 }
 
+#if 0
+static void CopyWndProcArgs(WndProcArgs& dest, WndProcArgs* src) {
+    dest.hwnd = src->hwnd;
+    dest.lparam = src->lparam;
+    dest.wparam = src->wparam;
+    dest.w = src->w;
+    dest.msg = src->msg;
+}
+#endif
+
 void TreeCtrl::WndProcParent(WndProcArgs* args) {
     auto* w = (TreeCtrl*)this;
     HWND hwnd = args->hwnd;
@@ -117,12 +127,12 @@ void TreeCtrl::WndProcParent(WndProcArgs* args) {
     if (msg == WM_NOTIFY) {
         NMTREEVIEWW* nm = (NMTREEVIEWW*)(lp);
         if (w->onTreeNotify) {
-            TreeNotifyArgs nargs{};
-            nargs.w = w;
-            nargs.treeView = nm;
-            nargs.procArgs = args;
+            TreeNotifyArgs a{};
+            a.procArgs = args;
+            a.w = w;
+            a.treeView = nm;
 
-            w->onTreeNotify(&nargs);
+            w->onTreeNotify(&a);
             if (args->didHandle) {
                 return;
             }
@@ -134,6 +144,7 @@ void TreeCtrl::WndProcParent(WndProcArgs* args) {
                 return;
             }
             TreeItmGetTooltipArgs a{};
+            a.procArgs = args;
             a.w = w;
             a.info = (NMTVGETINFOTIPW*)(nm);
             a.treeItem = w->GetTreeItemByHandle(a.info->hItem);
@@ -172,7 +183,6 @@ void TreeCtrl::WndProcParent(WndProcArgs* args) {
             if (!w->onTreeSelectionChanged) {
                 return;
             }
-
             TreeSelectionChangedArgs a;
             a.procArgs = args;
             a.w = w;
@@ -192,6 +202,9 @@ void TreeCtrl::WndProcParent(WndProcArgs* args) {
             a.treeItem = w->GetTreeItemByHandle(a.nmic->hItem);
             SetTreeItemState(a.nmic->uStateOld, a.prevState);
             SetTreeItemState(a.nmic->uStateNew, a.newState);
+            a.expandedChanged = (a.prevState.isExpanded != a.newState.isExpanded);
+            a.checkedChanged = (a.prevState.isChecked != a.newState.isChecked);
+            a.selectedChanged = (a.prevState.isSelected != a.newState.isSelected);
             onTreeItemChanged(&a);
             return;
         }
@@ -359,13 +372,17 @@ void TreeCtrl::SetTextColor(COLORREF col) {
 }
 
 void TreeCtrl::ExpandAll() {
+    SuspendRedraw();
     auto root = TreeView_GetRoot(this->hwnd);
     TreeViewExpandRecursively(this->hwnd, root, TVE_EXPAND, false);
+    ResumeRedraw();
 }
 
 void TreeCtrl::CollapseAll() {
+    SuspendRedraw();
     auto root = TreeView_GetRoot(this->hwnd);
     TreeViewExpandRecursively(this->hwnd, root, TVE_COLLAPSE, false);
+    ResumeRedraw();
 }
 
 void TreeCtrl::Clear() {

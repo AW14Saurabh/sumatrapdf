@@ -268,8 +268,6 @@ struct PageTreeStackItem {
     }
 };
 
-///// Above are extensions to Fitz and MuPDF, now follows PdfEngine /////
-
 class PdfEngineImpl : public EngineBase {
   public:
     PdfEngineImpl();
@@ -279,11 +277,8 @@ class PdfEngineImpl : public EngineBase {
     RectD PageMediabox(int pageNo) override;
     RectD PageContentBox(int pageNo, RenderTarget target = RenderTarget::View) override;
 
-    RenderedBitmap* RenderBitmap(int pageNo, float zoom, int rotation,
-                                 RectD* pageRect = nullptr, /* if nullptr: defaults to the page's mediabox */
-                                 RenderTarget target = RenderTarget::View, AbortCookie** cookie_out = nullptr) override;
+    RenderedBitmap* RenderPage(RenderPageArgs& args) override;
 
-    PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false) override;
     RectD Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse = false) override;
 
     std::string_view GetFileData() override;
@@ -294,7 +289,6 @@ class PdfEngineImpl : public EngineBase {
     bool HasClipOptimizations(int pageNo) override;
     WCHAR* GetProperty(DocumentProperty prop) override;
 
-    bool SupportsAnnotation(bool forSaving = false) const override;
     void UpdateUserAnnotations(Vec<PageAnnotation>* list) override;
 
     bool BenchLoadPage(int pageNo) override;
@@ -304,7 +298,7 @@ class PdfEngineImpl : public EngineBase {
     RenderedBitmap* GetImageForPageElement(PageElement*) override;
 
     PageDestination* GetNamedDest(const WCHAR* name) override;
-    DocTocTree* GetTocTree() override;
+    TocTree* GetToc() override;
 
     WCHAR* GetPageLabel(int pageNo) const override;
     int GetPageByLabel(const WCHAR* label) const override;
@@ -334,7 +328,7 @@ class PdfEngineImpl : public EngineBase {
 
     Vec<PageAnnotation> userAnnots; // TODO(port): put in PageInfo
 
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
 
     bool Load(const WCHAR* fileName, PasswordUI* pwdUI = nullptr);
     bool Load(IStream* stream, PasswordUI* pwdUI = nullptr);
@@ -347,7 +341,7 @@ class PdfEngineImpl : public EngineBase {
     FzPageInfo* GetFzPageInfo(int pageNo, bool failIfBusy = false);
     fz_matrix viewctm(int pageNo, float zoom, int rotation);
     fz_matrix viewctm(fz_page* page, float zoom, int rotation);
-    DocTocItem* BuildTocTree(DocTocItem* parent, fz_outline* entry, int& idCounter, bool isAttachment);
+    TocItem* BuildTocTree(TocItem* parent, fz_outline* entry, int& idCounter, bool isAttachment);
     void MakePageElementCommentsFromAnnotations(FzPageInfo* pageInfo);
     WCHAR* ExtractFontList();
     bool IsLinearizedFile();
@@ -381,6 +375,9 @@ static void fz_unlock_context_cs(void* user, int lock) {
 
 static void fz_print_cb(void* user, const char* msg) {
     log(msg);
+    if (!str::EndsWith(msg, "\n")) {
+        log("\n");
+    }
 }
 
 static void installFitzErrorCallbacks(fz_context* ctx) {
@@ -390,6 +387,8 @@ static void installFitzErrorCallbacks(fz_context* ctx) {
 
 PdfEngineImpl::PdfEngineImpl() {
     kind = kindEnginePdf;
+    supportsAnnotations = true;
+    supportsAnnotationsForSaving = true;
     defaultFileExt = L".pdf";
     fileDPI = 72.0f;
 
@@ -856,9 +855,9 @@ PageDestination* destFromAttachment(PdfEngineImpl* engine, fz_outline* outline) 
     return dest;
 }
 
-DocTocItem* PdfEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline, int& idCounter, bool isAttachment) {
-    DocTocItem* root = nullptr;
-    DocTocItem* curr = nullptr;
+TocItem* PdfEngineImpl::BuildTocTree(TocItem* parent, fz_outline* outline, int& idCounter, bool isAttachment) {
+    TocItem* root = nullptr;
+    TocItem* curr = nullptr;
 
     while (outline) {
         WCHAR* name = nullptr;
@@ -872,18 +871,27 @@ DocTocItem* PdfEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline,
         int pageNo = outline->page + 1;
 
         PageDestination* dest = nullptr;
+        Kind kindRaw = nullptr;
         if (isAttachment) {
+            kindRaw = kindTocFzOutlineAttachment;
             dest = destFromAttachment(this, outline);
         } else {
+            kindRaw = kindTocFzOutline;
             dest = newFzDestination(outline);
         }
 
-        DocTocItem* item = newDocTocItemWithDestination(parent, name, dest);
+        TocItem* item = newTocItemWithDestination(parent, name, dest);
+        item->kindRaw = kindRaw;
+        item->rawVal1 = str::Dup(outline->title);
+        item->rawVal2 = str::Dup(outline->uri);
+
         free(name);
         item->isOpenDefault = outline->is_open;
         item->id = ++idCounter;
         item->fontFlags = outline->flags;
         item->pageNo = pageNo;
+        CrashIf(!item->PageNumbersMatch());
+
         if (outline->has_color) {
             item->color = FromPdfColorRgba(outline->color);
         }
@@ -907,7 +915,7 @@ DocTocItem* PdfEngineImpl::BuildTocTree(DocTocItem* parent, fz_outline* outline,
 }
 
 // TODO: maybe build in FinishDownload
-DocTocTree* PdfEngineImpl::GetTocTree() {
+TocTree* PdfEngineImpl::GetToc() {
     if (tocTree) {
         return tocTree;
     }
@@ -917,8 +925,7 @@ DocTocTree* PdfEngineImpl::GetTocTree() {
 
     int idCounter = 0;
 
-    DocTocItem* root = nullptr;
-    const char* path = strconv::WstrToUtf8(fileName).data();
+    TocItem* root = nullptr;
     if (outline) {
         root = BuildTocTree(nullptr, outline, idCounter, false);
     }
@@ -926,19 +933,16 @@ DocTocTree* PdfEngineImpl::GetTocTree() {
         if (!root) {
             return nullptr;
         }
-        tocTree = new DocTocTree(root);
-        tocTree->filePath = path;
+        tocTree = new TocTree(root);
         return tocTree;
     }
-    DocTocItem* att = BuildTocTree(nullptr, attachments, idCounter, true);
+    TocItem* att = BuildTocTree(nullptr, attachments, idCounter, true);
     if (!root) {
-        tocTree = new DocTocTree(att);
-        tocTree->filePath = path;
+        tocTree = new TocTree(att);
         return tocTree;
     }
     root->AddSibling(att);
-    tocTree = new DocTocTree(root);
-    tocTree->filePath = path;
+    tocTree = new TocTree(root);
     return tocTree;
 }
 
@@ -1093,17 +1097,6 @@ RectD PdfEngineImpl::PageContentBox(int pageNo, RenderTarget target) {
     return rect2.Intersect(mediabox);
 }
 
-PointD PdfEngineImpl::Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
-    CrashIf(zoom <= 0);
-    fz_matrix ctm = viewctm(pageNo, zoom, rotation);
-    if (inverse) {
-        ctm = fz_invert_matrix(ctm);
-    }
-    fz_point pt2 = {(float)pt.x, (float)pt.y};
-    pt2 = fz_transform_point(pt2, ctm);
-    return PointD(pt2.x, pt2.y);
-}
-
 RectD PdfEngineImpl::Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse) {
     CrashIf(zoom <= 0);
     fz_matrix ctm = viewctm(pageNo, zoom, rotation);
@@ -1115,28 +1108,33 @@ RectD PdfEngineImpl::Transform(RectD rect, int pageNo, float zoom, int rotation,
     return fz_rect_to_RectD(rect2);
 }
 
-RenderedBitmap* PdfEngineImpl::RenderBitmap(int pageNo, float zoom, int rotation, RectD* pageRect, RenderTarget target,
-                                            AbortCookie** cookie_out) {
+RenderedBitmap* PdfEngineImpl::RenderPage(RenderPageArgs& args) {
+    auto pageNo = args.pageNo;
+
     FzPageInfo* pageInfo = GetFzPageInfo(pageNo);
     fz_page* page = pageInfo->page;
     pdf_page* pdfpage = pdf_page_from_fz_page(ctx, page);
-    int transparency = pdfpage->transparency;
 
     if (!page || !pageInfo->list) {
         return nullptr;
     }
 
+    int transparency = pdfpage->transparency;
+
     fz_cookie* fzcookie = nullptr;
     FitzAbortCookie* cookie = nullptr;
-    if (cookie_out) {
+    if (args.cookie_out) {
         cookie = new FitzAbortCookie();
-        *cookie_out = cookie;
+        *args.cookie_out = cookie;
         fzcookie = &cookie->cookie;
     }
 
     // TODO(port): I don't see why this lock is needed
     ScopedCritSec cs(ctxAccess);
 
+    auto pageRect = args.pageRect;
+    auto zoom = args.zoom;
+    auto rotation = args.rotation;
     fz_rect pRect;
     if (pageRect) {
         pRect = RectD_to_fz_rect(*pageRect);
@@ -1621,10 +1619,6 @@ WCHAR* PdfEngineImpl::GetProperty(DocumentProperty prop) {
     }
     return nullptr;
 };
-
-bool PdfEngineImpl::SupportsAnnotation(bool forSaving) const {
-    return true;
-}
 
 void PdfEngineImpl::UpdateUserAnnotations(Vec<PageAnnotation>* list) {
     // TODO: use a new critical section to avoid blocking the UI thread

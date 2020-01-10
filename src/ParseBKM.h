@@ -1,16 +1,35 @@
 /* Copyright 2020 the SumatraPDF project authors (see AUTHORS file).
    License: Simplified BSD (see COPYING.BSD) */
 
-struct Bookmarks {
+// represents bookmarks for a single file
+struct VbkmForFile {
+    // path of the original file
     AutoFree filePath;
-    DocTocTree* toc = nullptr;
+    // TODO: serialize nPages after "file:"
     int nPages = 0;
 
-    Bookmarks() = default;
-    ~Bookmarks();
+    TocTree* toc = nullptr;
+
+    EngineBase* engine = nullptr;
+
+    VbkmForFile() = default;
+    ~VbkmForFile();
 };
 
-bool ParseBookmarksFile(std::string_view path, Vec<Bookmarks*>* bkms);
-bool ExportBookmarksToFile(const Vec<Bookmarks*>&, const char* path);
+// represents a .vbkm file which represents one or more
+// physical files
+struct VbkmFile {
+    AutoFree fileContent;
+    AutoFree name;
+    Vec<VbkmForFile*> vbkms;
 
-Vec<Bookmarks*>* LoadAlterenativeBookmarks(std::string_view baseFileName);
+    VbkmFile() = default;
+    ~VbkmFile();
+};
+
+bool ExportBookmarksToFile(const Vec<VbkmForFile*>&, const char* name, const char* path);
+
+bool LoadAlterenativeBookmarks(std::string_view baseFileName, VbkmFile& vbkm);
+
+bool ParseVbkmFile(std::string_view d, VbkmFile& vbkm);
+bool LoadVbkmFile(const char* filePath, VbkmFile& vbkm);

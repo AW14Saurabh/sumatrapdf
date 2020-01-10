@@ -58,7 +58,7 @@ static void CustomizeTocTooltip(TreeItmGetTooltipArgs* args) {
     auto* w = args->w;
     auto* ti = args->treeItem;
     auto* nm = args->info;
-    DocTocItem* tocItem = (DocTocItem*)ti;
+    TocItem* tocItem = (TocItem*)ti;
     PageDestination* link = tocItem->GetPageDestination();
     if (!link) {
         return;
@@ -72,8 +72,8 @@ static void CustomizeTocTooltip(TreeItmGetTooltipArgs* args) {
     }
     CrashIf(!link); // /analyze claims that this could happen - it really can't
     auto k = link->Kind();
-    // TODO: DocTocItem from Chm contain other types
-    // we probably shouldn't set DocTocItem::dest there
+    // TODO: TocItem from Chm contain other types
+    // we probably shouldn't set TocItem::dest there
     if (k == kindDestinationScrollTo) {
         return;
     }
@@ -136,7 +136,7 @@ static void RelayoutTocItem(LPNMTVCUSTOMDRAW ntvcd) {
 
     // Draw the page number right-aligned (if there is one)
     WindowInfo* win = FindWindowInfoByHwnd(hTV);
-    DocTocItem* tocItem = (DocTocItem*)item.lParam;
+    TocItem* tocItem = (TocItem*)item.lParam;
     AutoFreeWstr label;
     if (tocItem->pageNo && win && win->IsDocLoaded()) {
         label.Set(win->ctrl->GetPageLabel(tocItem->pageNo));
@@ -174,7 +174,7 @@ static void RelayoutTocItem(LPNMTVCUSTOMDRAW ntvcd) {
 }
 #endif
 
-static void GoToTocLinkTask(WindowInfo* win, DocTocItem* tocItem, TabInfo* tab, Controller* ctrl) {
+static void GoToTocLinkTask(WindowInfo* win, TocItem* tocItem, TabInfo* tab, Controller* ctrl) {
     // tocItem is invalid if the Controller has been replaced
     if (!WindowInfoStillValid(win) || win->currentTab != tab || tab->ctrl != ctrl)
         return;
@@ -214,7 +214,7 @@ static void GoToTocLinkForTVItem(WindowInfo* win, HTREEITEM hItem, bool allowExt
     if (!ti) {
         return;
     }
-    DocTocItem* tocItem = (DocTocItem*)ti;
+    TocItem* tocItem = (TocItem*)ti;
     bool validPage = (tocItem->pageNo > 0);
     bool isScroll = IsScrollToLink(tocItem->GetPageDestination());
     if (validPage || (allowExternal || isScroll)) {
@@ -252,7 +252,7 @@ void ToggleTocBox(WindowInfo* win) {
 
 // find the closest item in tree view to a given page number
 static TreeItem* TreeItemForPageNo(TreeCtrl* treeCtrl, int pageNo) {
-    DocTocItem* bestMatch = nullptr;
+    TocItem* bestMatch = nullptr;
     int bestMatchPageNo = 0;
 
     TreeModel* tm = treeCtrl->treeModel;
@@ -260,7 +260,7 @@ static TreeItem* TreeItemForPageNo(TreeCtrl* treeCtrl, int pageNo) {
         return nullptr;
     }
     VisitTreeModelItems(tm, [&](TreeItem* ti) {
-        auto* docItem = (DocTocItem*)ti;
+        auto* docItem = (TocItem*)ti;
         if (!docItem) {
             return true;
         }
@@ -294,58 +294,62 @@ void UpdateTocSelection(WindowInfo* win, int currPageNo) {
     }
 }
 
-static void UpdateDocTocExpansionState(TreeCtrl* treeCtrl, Vec<int>& tocState, DocTocItem* tocItem) {
+static void UpdateDocTocExpansionStateRecur(TreeCtrl* treeCtrl, Vec<int>& tocState, TocItem* tocItem) {
     while (tocItem) {
         // items without children cannot be toggled
         if (tocItem->child) {
             // we have to query the state of the tree view item because
             // isOpenToggled is not kept in sync
-            // TODO: keep toggle state on DocTocItem in sync
+            // TODO: keep toggle state on TocItem in sync
             // by subscribing to the right notifications
             bool isExpanded = treeCtrl->IsExpanded(tocItem);
             bool wasToggled = isExpanded != tocItem->isOpenDefault;
             if (wasToggled) {
                 tocState.Append(tocItem->id);
             }
-            UpdateDocTocExpansionState(treeCtrl, tocState, tocItem->child);
+            UpdateDocTocExpansionStateRecur(treeCtrl, tocState, tocItem->child);
         }
         tocItem = tocItem->next;
     }
 }
 
-void UpdateTocExpansionState(Vec<int>& tocState, TreeCtrl* treeCtrl, DocTocTree* docTree) {
+void UpdateTocExpansionState(Vec<int>& tocState, TreeCtrl* treeCtrl, TocTree* docTree) {
     if (treeCtrl->treeModel != docTree) {
         // CrashMe();
         return;
     }
     tocState.Reset();
-    DocTocItem* tocItem = docTree->root;
-    UpdateDocTocExpansionState(treeCtrl, tocState, tocItem);
+    TocItem* tocItem = docTree->root;
+    UpdateDocTocExpansionStateRecur(treeCtrl, tocState, tocItem);
 }
 
 // copied from mupdf/fitz/dev_text.c
-#define ISLEFTTORIGHTCHAR(c) \
-    ((0x0041 <= (c) && (c) <= 0x005A) || (0x0061 <= (c) && (c) <= 0x007A) || (0xFB00 <= (c) && (c) <= 0xFB06))
-#define ISRIGHTTOLEFTCHAR(c)                                                                                     \
-    ((0x0590 <= (c) && (c) <= 0x05FF) || (0x0600 <= (c) && (c) <= 0x06FF) || (0x0750 <= (c) && (c) <= 0x077F) || \
-     (0xFB50 <= (c) && (c) <= 0xFDFF) || (0xFE70 <= (c) && (c) <= 0xFEFE))
+static bool isLeftToRightChar(WCHAR c) {
+    return ((0x0041 <= (c) && (c) <= 0x005A) || (0x0061 <= (c) && (c) <= 0x007A) || (0xFB00 <= (c) && (c) <= 0xFB06));
+}
 
-static void GetLeftRightCounts(DocTocItem* node, int& l2r, int& r2l) {
+static bool isRightToLeftChar(WCHAR c) {
+    return ((0x0590 <= (c) && (c) <= 0x05FF) || (0x0600 <= (c) && (c) <= 0x06FF) || (0x0750 <= (c) && (c) <= 0x077F) ||
+            (0xFB50 <= (c) && (c) <= 0xFDFF) || (0xFE70 <= (c) && (c) <= 0xFEFE));
+}
+
+static void GetLeftRightCounts(TocItem* node, int& l2r, int& r2l) {
     if (!node)
         return;
     if (node->title) {
         for (const WCHAR* c = node->title; *c; c++) {
-            if (ISLEFTTORIGHTCHAR(*c))
+            if (isLeftToRightChar(*c)) {
                 l2r++;
-            else if (ISRIGHTTOLEFTCHAR(*c))
+            } else if (isRightToLeftChar(*c)) {
                 r2l++;
+            }
         }
     }
     GetLeftRightCounts(node->child, l2r, r2l);
     GetLeftRightCounts(node->next, l2r, r2l);
 }
 
-static void SetInitialExpandState(DocTocItem* item, Vec<int>& tocState) {
+static void SetInitialExpandState(TocItem* item, Vec<int>& tocState) {
     while (item) {
         if (tocState.Contains(item->id)) {
             item->isOpenToggled = true;
@@ -365,15 +369,15 @@ void ShowExportedBookmarksMsg(const char* path) {
 }
 
 static void ExportBookmarksFromTab(TabInfo* tab) {
-    auto* tocTree = tab->ctrl->GetTocTree();
+    auto* tocTree = tab->ctrl->GetToc();
     str::Str path = strconv::WstrToUtf8(tab->filePath.get());
     path.Append(".bkm");
-    Vec<Bookmarks*> bookmarks;
+    Vec<VbkmForFile*> bookmarks;
 
-    Bookmarks* bkms = new Bookmarks();
-    bkms->toc = CloneDocTocTree(tocTree);
+    VbkmForFile* bkms = new VbkmForFile();
+    bkms->toc = CloneTocTree(tocTree, false);
     bookmarks.push_back(bkms);
-    bool ok = ExportBookmarksToFile(bookmarks, path.c_str());
+    bool ok = ExportBookmarksToFile(bookmarks, "", path.c_str());
     delete bkms;
 
     ShowExportedBookmarksMsg(path.c_str());
@@ -395,7 +399,7 @@ static MenuDef contextMenuDef[] = {
 };
 // clang-format on
 
-static void AddFavoriteFromToc(WindowInfo* win, DocTocItem* dti) {
+static void AddFavoriteFromToc(WindowInfo* win, TocItem* dti) {
     int pageNo = 0;
     if (dti->dest) {
         pageNo = dti->dest->GetPageNo();
@@ -405,17 +409,37 @@ static void AddFavoriteFromToc(WindowInfo* win, DocTocItem* dti) {
     AddFavoriteWithLabelAndName(win, pageNo, pageLabel.Get(), name);
 }
 
+static bool IsForVbkm(WindowInfo* win) {
+    auto path = win->currentTab->filePath.get();
+    bool isVbkm = str::EndsWithI(path, L".vbkm");
+    return isVbkm;
+}
+
 static void StartTocEditorForWindowInfo(WindowInfo* win) {
     auto* tab = win->currentTab;
     TocEditorArgs* args = new TocEditorArgs();
     // args->filePath = str::Dup(tab->filePath);
-    Bookmarks* bkms = new Bookmarks();
-    bkms->filePath = (char*)strconv::WstrToUtf8(tab->filePath).data();
-    bkms->nPages = tab->ctrl->PageCount();
 
-    DocTocTree* tree = (DocTocTree*)win->tocTreeCtrl->treeModel;
-    bkms->toc = CloneDocTocTree(tree);
-    args->bookmarks.push_back(bkms);
+    VbkmFile vbkm;
+    AutoFree filePath = strconv::WstrToUtf8(tab->filePath);
+    if (str::EndsWithI(tab->filePath, L".vbkm")) {
+        LoadVbkmFile(filePath, vbkm);
+        int n = vbkm.vbkms.isize();
+        for (int i = 0; i < n; i++) {
+            auto b = vbkm.vbkms[i];
+            args->bookmarks.push_back(b);
+        }
+        vbkm.vbkms.clear();
+    } else {
+        VbkmForFile* bkms = new VbkmForFile();
+        bkms->filePath = filePath.release();
+        bkms->nPages = tab->ctrl->PageCount();
+
+        TocTree* tree = (TocTree*)win->tocTreeCtrl->treeModel;
+        bkms->toc = CloneTocTree(tree, false);
+        args->bookmarks.push_back(bkms);
+    }
+
     args->hwndRelatedTo = win->hwndFrame;
     StartTocEditor(args);
 }
@@ -431,7 +455,7 @@ static void OnTocContextMenu(ContextMenuArgs* args) {
         pt = {args->mouseGlobal.x, args->mouseGlobal.y};
     }
     int pageNo = 0;
-    DocTocItem* dti = (DocTocItem*)ti;
+    TocItem* dti = (TocItem*)ti;
     if (dti && dti->dest) {
         pageNo = dti->dest->GetPageNo();
     }
@@ -466,6 +490,10 @@ static void OnTocContextMenu(ContextMenuArgs* args) {
         win::menu::Remove(popup, IDM_FAV_DEL);
     }
 
+    if (IsForVbkm(win)) {
+        win::menu::SetText(popup, IDM_NEW_BOOKMARKS, L"Edit Bookmarks");
+    }
+
     // MarkMenuOwnerDraw(popup);
     UINT flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
     INT cmd = TrackPopupMenu(popup, flags, pt.x, pt.y, 0, win->hwndFrame, nullptr);
@@ -495,19 +523,20 @@ static void OnTocContextMenu(ContextMenuArgs* args) {
 }
 
 static void AltBookmarksChanged(WindowInfo* win, TabInfo* tab, int n, std::string_view s) {
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
     if (n == 0) {
-        tocTree = tab->ctrl->GetTocTree();
+        tocTree = tab->ctrl->GetToc();
     } else {
-        tocTree = tab->altBookmarks->at(n - 1)->toc;
+        auto vbkms = tab->altBookmarks[0]->vbkms;
+        tocTree = vbkms.at(n - 1)->toc;
     }
     win->tocTreeCtrl->SetTreeModel(tocTree);
 }
 
 // TODO: temporary
-static Vec<Bookmarks*>* LoadAlterenativeBookmarks(const WCHAR* baseFileName) {
+static bool LoadAlterenativeBookmarks(const WCHAR* baseFileName, VbkmFile& vbkm) {
     AutoFree tmp = strconv::WstrToUtf8(baseFileName);
-    return LoadAlterenativeBookmarks(tmp.as_view());
+    return LoadAlterenativeBookmarks(tmp.as_view(), vbkm);
 }
 
 static bool ShouldCustomDraw(WindowInfo* win) {
@@ -522,7 +551,7 @@ static bool ShouldCustomDraw(WindowInfo* win) {
         return false;
     }
     Kind kind = dm->GetEngineType();
-    if (kind == kindEnginePdf || kind == kindEnginePdfMulti) {
+    if (kind == kindEnginePdf || kind == kindEngineMulti) {
         return true;
     }
     return false;
@@ -540,22 +569,27 @@ void LoadTocTree(WindowInfo* win) {
 
     win->tocLoaded = true;
 
-    auto* tocTree = tab->ctrl->GetTocTree();
+    auto* tocTree = tab->ctrl->GetToc();
     if (!tocTree || !tocTree->root) {
         return;
     }
 
     // TODO: for now just for testing
-    auto* altTocs = LoadAlterenativeBookmarks(tab->filePath);
-    if (altTocs && altTocs->size() > 0) {
-        tab->altBookmarks = altTocs;
+    // TODO: restore showing alternative bookmarks
+    VbkmFile* vbkm = new VbkmFile();
+    bool ok = LoadAlterenativeBookmarks(tab->filePath, *vbkm);
+    if (ok && vbkm->vbkms.size() > 0) {
+        tab->altBookmarks.push_back(vbkm);
         Vec<std::string_view> items;
+        size_t n = vbkm->vbkms.size();
         items.Append("Default");
-        for (size_t i = 0; i < altTocs->size(); i++) {
-            DocTocTree* toc = altTocs->at(i)->toc;
-            items.Append(toc->name.get());
+        char* name = vbkm->name.get();
+        if (name) {
+            items.Append(name);
         }
         win->altBookmarks->SetItems(items);
+    } else {
+        delete vbkm;
     }
 
     win->altBookmarks->OnDropDownSelectionChanged = [=](int idx, std::string_view s) {
@@ -631,7 +665,7 @@ void OnDocTocCustomDraw(TreeItemCustomDrawArgs* args) {
 
     if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
         // called before drawing each item
-        DocTocItem* tocItem = (DocTocItem*)args->treeItem;
+        TocItem* tocItem = (TocItem*)args->treeItem;
         ;
         if (!tocItem) {
             return;

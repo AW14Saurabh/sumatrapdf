@@ -41,6 +41,7 @@ class CommandLineInfo {
     bool invertColors = false;
     bool regress = false;
     bool tester = false;
+    bool ramicro = false;
 
     // stress-testing related
     WCHAR* stressTestPath = nullptr;
@@ -55,6 +56,7 @@ class CommandLineInfo {
     bool testRenderPage = false;
     bool testExtractPage = false;
     int testPageNo = 0;
+    bool testApp = false;
 
     bool crashOnOpen = false;
 

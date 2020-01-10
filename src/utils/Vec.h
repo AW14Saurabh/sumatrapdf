@@ -129,12 +129,12 @@ class Vec {
         return *this;
     }
 
-    T& operator[](size_t idx) const {
+    [[nodiscard]] T& operator[](size_t idx) const {
         CrashIf(idx >= len);
         return els[idx];
     }
 
-    T& operator[](int idx) const {
+    [[nodiscard]] T& operator[](int idx) const {
         CrashIf(idx < 0);
         CrashIf((size_t)idx >= len);
         return els[idx];
@@ -157,19 +157,22 @@ class Vec {
         return MakeSpaceAt(0, newSize);
     }
 
-    T& at(size_t idx) const {
+    [[nodiscard]] T& at(size_t idx) const {
         CrashIf(idx >= len);
         return els[idx];
     }
 
-    T& at(int idx) const {
+    [[nodiscard]] T& at(int idx) const {
         CrashIf(idx < 0);
         CrashIf((size_t)idx >= len);
         return els[idx];
     }
 
-    size_t size() const {
+    [[nodiscard]] size_t size() const {
         return len;
+    }
+    [[nodiscard]] int isize() const {
+        return (int)len;
     }
 
     bool InsertAt(size_t idx, const T& el) {
@@ -253,7 +256,7 @@ class Vec {
         return el;
     }
 
-    T& Last() const {
+    [[nodiscard]] T& Last() const {
         CrashIf(0 == len);
         return at(len - 1);
     }
@@ -262,7 +265,7 @@ class Vec {
     // without duplicate allocation. Note: since Vec over-allocates, this
     // is likely to use more memory than strictly necessary, but in most cases
     // it doesn't matter
-    T* StealData() {
+    [[nodiscard]] T* StealData() {
         T* res = els;
         if (els == buf) {
             res = (T*)Allocator::MemDup(allocator, buf, (len + PADDING) * sizeof(T));
@@ -272,11 +275,11 @@ class Vec {
         return res;
     }
 
-    T* LendData() const {
+    [[nodiscard]] T* LendData() const {
         return els;
     }
 
-    int Find(T el, size_t startAt = 0) const {
+    [[nodiscard]] int Find(T el, size_t startAt = 0) const {
         for (size_t i = startAt; i < len; i++) {
             if (els[i] == el) {
                 return (int)i;
@@ -285,18 +288,18 @@ class Vec {
         return -1;
     }
 
-    bool Contains(T el) const {
+    [[nodiscard]] bool Contains(T el) const {
         return -1 != Find(el);
     }
 
-    // returns true if removed
-    bool Remove(T el) {
+    // returns position of removed element or -1 if not removed
+    int Remove(T el) {
         int i = Find(el);
         if (-1 == i) {
-            return false;
+            return -1;
         }
         RemoveAt(i);
-        return true;
+        return i;
     }
 
     void Sort(int (*cmpFunc)(const void* a, const void* b)) {
@@ -318,7 +321,7 @@ class Vec {
         return els[len]; // nullptr-sentinel
     }
 
-    bool empty() const {
+    [[nodiscard]] bool empty() const {
         return len == 0;
     }
 
@@ -348,14 +351,6 @@ inline void DeleteVecMembers(Vec<T>& v) {
         delete el;
     }
     v.Reset();
-}
-
-template <typename T>
-inline void DeleteVecMembers(std::vector<T>& v) {
-    for (T& el : v) {
-        delete el;
-    }
-    v.clear();
 }
 
 namespace str {

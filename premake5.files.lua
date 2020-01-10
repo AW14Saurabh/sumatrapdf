@@ -387,15 +387,19 @@ function freetype_files()
   })
 end
 
-function sumatra_files()
+files {
+}
+
+function sumatrapdf_files()
   files_in_dir("src", {
+    "AppColors.*",
     "AppPrefs.*",
     "AppTools.*",
     "AppUtil.*",
     "Caption.*",
     "Canvas.*",
     "ChmModel.*",
-    "AppColors.*",
+    "CommandLineInfo.*",
     "CrashHandler.*",
     "DisplayModel.*",
     "Doc.*",
@@ -405,13 +409,17 @@ function sumatra_files()
     "Favorites.*",
     "FileHistory.*",
     "FileThumbnails.*",
+    "GetDocumentOutlines.*",
     "GlobalPrefs.*",
+    "Installer.h",
+    "Installer.cpp",
+    "InstUninstCommon.cpp",
+    "Uninstaller.cpp",
     "Menu.*",
     "MuiEbookPageDef.*",
     "Notifications.*",
     "PagesLayoutDef.*",
     "ParseBKM.*",
-    "CommandLineInfo.*",
     "PdfSync.*",
     "Print.*",
     "ProgressUpdateUI.*",
@@ -419,6 +427,10 @@ function sumatra_files()
     "Search.*",
     "Selection.*",
     "SettingsStructs.*",
+    "SumatraPDF.cpp",
+    "SumatraPDF.rc",
+    "SumatraStartup.cpp",
+    "SumatraConfig.cpp",
     "SumatraAbout.*",
     "SumatraAbout2.*",
     "SumatraDialogs.*",
@@ -438,8 +450,10 @@ function sumatra_files()
     "Version.h",
     "WindowInfo.*",
 
+    "Tests.cpp",
     "regress/Regress.*",
   })
+  test_app_files_2()
 end
 
 
@@ -541,6 +555,7 @@ function engines_files()
     "FileModifications.*",
     "HtmlFormatter.*",
     "MobiDoc.*",
+    "ParseBKM.*",
     "PdfCreator.*",
 
     "utils/PalmDbReader.*",
@@ -815,20 +830,6 @@ function mudraw_files()
   })
 end
 
-function sumatrapdf_files()
-  files {
-    "src/SumatraPDF.cpp",
-    "src/SumatraStartup.cpp",
-    "src/SumatraConfig.cpp",
-    "src/Tests.cpp",
-    "src/Installer.h",
-    "src/Installer.cpp",
-    "src/InstUninstCommon.cpp",
-    "src/Uninstaller.cpp",
-    "src/SumatraPDF.rc",
-  }
-end
-
 function synctex_files()
   files {
     "ext/synctex/synctex_parser_utils.c",
@@ -918,6 +919,9 @@ function pdf_preview_files()
 
   filter {"configurations:Debug"}
     files_in_dir("src", {
+      "utils/PalmDbReader.*",
+      "mui/MiniMui.*",
+      "mui/TextRender.*",
       "ChmDoc.*",
       "EbookDoc.*",
       "EngineEbook.*",
@@ -927,9 +931,7 @@ function pdf_preview_files()
       "HtmlFormatter.*",
       "MobiDoc.*",
       "PdfCreator.*",
-      "utils/PalmDbReader.*",
-      "mui/MiniMui.*",
-      "mui/TextRender.*",
+      "SumatraConfig.*",
     })
   filter {}
 end
@@ -960,6 +962,15 @@ function pdf_filter_files()
       "src/utils/PalmDbReader.*",
     }
   filter {}
+end
+
+function test_app_files_2()
+  files_in_dir("tools/test-app", {
+    "TestApp.cpp",
+    "TestDirectDraw.cpp",
+    "TestTab.cpp",
+    "TestLayout.cpp",
+  })
 end
 
 function test_app_files()

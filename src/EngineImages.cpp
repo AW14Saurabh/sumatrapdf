@@ -47,11 +47,8 @@ class ImagesEngine : public EngineBase {
 
     RectD PageMediabox(int pageNo) override;
 
-    RenderedBitmap* RenderBitmap(int pageNo, float zoom, int rotation,
-                                 RectD* pageRect = nullptr, /* if nullptr: defaults to the page's mediabox */
-                                 RenderTarget target = RenderTarget::View, AbortCookie** cookie_out = nullptr) override;
+    RenderedBitmap* RenderPage(RenderPageArgs& args) override;
 
-    PointD Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse = false) override;
     RectD Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse = false) override;
 
     std::string_view GetFileData() override;
@@ -66,10 +63,6 @@ class ImagesEngine : public EngineBase {
         return false;
     }
 
-    bool SupportsAnnotation(bool forSaving = false) const override {
-        UNUSED(forSaving);
-        return false;
-    }
     void UpdateUserAnnotations(Vec<PageAnnotation>* list) override {
         UNUSED(list);
     }
@@ -105,6 +98,9 @@ class ImagesEngine : public EngineBase {
 
 ImagesEngine::ImagesEngine() {
     kind = kindEngineImage;
+
+    supportsAnnotations = false;
+    supportsAnnotationsForSaving = false;
     preferredLayout = Layout_NonContinuous;
     isImageCollection = true;
 
@@ -131,10 +127,12 @@ RectD ImagesEngine::PageMediabox(int pageNo) {
     return mediaboxes.at(n);
 }
 
-RenderedBitmap* ImagesEngine::RenderBitmap(int pageNo, float zoom, int rotation, RectD* pageRect, RenderTarget target,
-                                           AbortCookie** cookieOut) {
-    UNUSED(target);
-    UNUSED(cookieOut);
+RenderedBitmap* ImagesEngine::RenderPage(RenderPageArgs& args) {
+    auto pageNo = args.pageNo;
+    auto pageRect = args.pageRect;
+    auto zoom = args.zoom;
+    auto rotation = args.rotation;
+
     ImagePage* page = GetPage(pageNo);
     if (!page) {
         return nullptr;
@@ -185,11 +183,6 @@ RenderedBitmap* ImagesEngine::RenderBitmap(int pageNo, float zoom, int rotation,
 
 void ImagesEngine::GetTransform(Matrix& m, int pageNo, float zoom, int rotation) {
     GetBaseTransform(m, PageMediabox(pageNo).ToGdipRectF(), zoom, rotation);
-}
-
-PointD ImagesEngine::Transform(PointD pt, int pageNo, float zoom, int rotation, bool inverse) {
-    RectD rect = Transform(RectD(pt, SizeD()), pageNo, zoom, rotation, inverse);
-    return PointD(rect.x, rect.y);
 }
 
 RectD ImagesEngine::Transform(RectD rect, int pageNo, float zoom, int rotation, bool inverse) {
@@ -674,7 +667,7 @@ class ImageDirEngineImpl : public ImagesEngine {
     WCHAR* GetPageLabel(int pageNo) const override;
     int GetPageByLabel(const WCHAR* label) const override;
 
-    DocTocTree* GetTocTree() override;
+    TocTree* GetToc() override;
 
     bool SaveFileAsPDF(const char* pdfFileName, bool includeUserAnnots = false) override;
 
@@ -687,7 +680,7 @@ class ImageDirEngineImpl : public ImagesEngine {
     RectD LoadMediabox(int pageNo) override;
 
     WStrVec pageFileNames;
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
 };
 
 bool ImageDirEngineImpl::LoadImageDir(const WCHAR* dirName) {
@@ -748,26 +741,24 @@ int ImageDirEngineImpl::GetPageByLabel(const WCHAR* label) const {
     return EngineBase::GetPageByLabel(label);
 }
 
-static DocTocItem* newImageDirTocItem(DocTocItem* parent, WCHAR* title, int pageNo) {
-    return new DocTocItem(parent, title, pageNo);
+static TocItem* newImageDirTocItem(TocItem* parent, WCHAR* title, int pageNo) {
+    return new TocItem(parent, title, pageNo);
 };
 
-DocTocTree* ImageDirEngineImpl::GetTocTree() {
+TocTree* ImageDirEngineImpl::GetToc() {
     if (tocTree) {
         return tocTree;
     }
     AutoFreeWstr ws = GetPageLabel(1);
-    DocTocItem* root = newImageDirTocItem(nullptr, ws, 1);
+    TocItem* root = newImageDirTocItem(nullptr, ws, 1);
     root->id = 1;
     for (int i = 2; i <= PageCount(); i++) {
         ws = GetPageLabel(i);
-        DocTocItem* item = newImageDirTocItem(root, ws, i);
+        TocItem* item = newImageDirTocItem(root, ws, i);
         item->id = i;
         root->AddSibling(item);
     }
-    tocTree = new DocTocTree(root);
-    const char* path = strconv::WstrToUtf8(fileName).data();
-    tocTree->filePath = path;
+    tocTree = new TocTree(root);
     return tocTree;
 }
 
@@ -855,7 +846,7 @@ class CbxEngineImpl : public ImagesEngine, public json::ValueVisitor {
 
     const WCHAR* GetDefaultFileExt() const;
 
-    DocTocTree* GetTocTree() override;
+    TocTree* GetToc() override;
 
     // json::ValueVisitor
     bool Visit(const char* path, const char* value, json::DataType type) override;
@@ -880,7 +871,7 @@ class CbxEngineImpl : public ImagesEngine, public json::ValueVisitor {
     // access to cbxFile must be protected after initialization (with cacheAccess)
     MultiFormatArchive* cbxFile = nullptr;
     Vec<MultiFormatArchive::FileInfo*> files;
-    DocTocTree* tocTree = nullptr;
+    TocTree* tocTree = nullptr;
 
     // not owned
     const WCHAR* defaultExt = nullptr;
@@ -905,7 +896,9 @@ CbxEngineImpl::CbxEngineImpl(MultiFormatArchive* arch) {
 CbxEngineImpl::~CbxEngineImpl() {
     delete tocTree;
 
-    CrashIf(cbxFile);
+    // can be set in error conditions but generally is
+    // deleted in FinishLoading
+    delete cbxFile;
 
     for (auto&& img : images) {
         free(img.data);
@@ -1026,13 +1019,13 @@ bool CbxEngineImpl::FinishLoading() {
         return false;
     }
 
-    DocTocItem* root = nullptr;
-    DocTocItem* curr = nullptr;
+    TocItem* root = nullptr;
+    TocItem* curr = nullptr;
     for (int i = 0; i < pageCount; i++) {
         std::string_view fname = pageFiles[i]->name;
         AutoFreeWstr name = strconv::Utf8ToWstr(fname);
         const WCHAR* baseName = path::GetBaseNameNoFree(name.get());
-        DocTocItem* ti = new DocTocItem(nullptr, baseName, i + 1);
+        TocItem* ti = new TocItem(nullptr, baseName, i + 1);
         if (root == nullptr) {
             root = ti;
             curr = ti;
@@ -1041,8 +1034,7 @@ bool CbxEngineImpl::FinishLoading() {
             curr = ti;
         }
     }
-    tocTree = new DocTocTree(root);
-    tocTree->filePath = strconv::WstrToUtf8(FileName());
+    tocTree = new TocTree(root);
 
     for (int i = 0; i < pageCount; i++) {
         size_t fileId = files[i]->fileId;
@@ -1059,7 +1051,7 @@ bool CbxEngineImpl::FinishLoading() {
     return true;
 }
 
-DocTocTree* CbxEngineImpl::GetTocTree() {
+TocTree* CbxEngineImpl::GetToc() {
     return tocTree;
 }
 
